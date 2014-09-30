@@ -128,6 +128,7 @@ start0(_Options) ->
 
 
   application:start(crypto),
+  application:start(asn1),
   application:start(public_key),
   application:start(ssl),
   start_app(lhttpc),

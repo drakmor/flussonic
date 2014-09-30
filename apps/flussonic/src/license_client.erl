@@ -155,7 +155,7 @@ load_code_from_disk(LicenseKey) ->
       error_logger:info_msg("Loading licensed code from ~s", [FullName]),
       file:close(IO),
       {ok, Cypher} = file:read_file(FullName),
-      Bin = crypto:aes_ctr_decrypt(license_to_key(LicenseKey), <<0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0>>, Cypher),
+      Bin = crypto:stream_decrypt(license_to_key(LicenseKey), Cypher),
       eval_bin(Bin);
     {error, _} ->
       undefined
