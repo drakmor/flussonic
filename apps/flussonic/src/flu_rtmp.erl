@@ -510,6 +510,27 @@ publish0(Session, #rtmp_funcall{stream_id = StreamId, args = [null, Name |Publis
 
   {RawName, Args} = http_uri2:parse_path_query(Name),
   
+
+
+  case proplists:get_value(steamkey_api, Options) of
+    ApiEndpoint when ApiEndpoint =/= undefined ->
+      EndPoint = binary_to_list(iolist_to_binary([ApiEndpoint, "/", Name])),
+      case lhttpc:request(EndPoint, "GET", [], 30000) of
+        {ok,{{Code,_},_Headers,_Body}} when Code == 200 orelse Code == 302 ->
+          ok;
+        {ok,{{403,_},_Headers,_Body}} ->
+          lager:error("Publish denied, api returned: ~p", [_Body]),
+          throw({fail, [403, StreamName, <<"bad_key">>]});
+        {ok,{{500,_},_Headers,_Body}} ->
+          lager:error("500 error on api: ~p", [_Body]),
+          throw({fail, [403, StreamName, <<"error_500">>]});
+        {error, _} ->
+          lager:error("Unabled to connect to api.", []),
+          throw({fail, [403, StreamName, <<"api_down">>]})
+      end
+  end,
+
+
   case proplists:get_value(password, Options) of
     RequiredPassword when RequiredPassword =/= undefined ->
       case proplists:get_value("password", Args) of

@@ -49,7 +49,7 @@
 % Helpers callbacks
 -export([start_helper/3, stop_helper/2, find_helper/2]).
 
-
+-export([notify_webhook/2]).
 
 -export([autostart/1, restart/1, stop/1]).
 -export([autostart/2, list/0, json_list/0]).
@@ -973,8 +973,36 @@ after_terminate(Name, Attrs) ->
   Keys = [hls,hds,rtmp,bytes_in,bytes_out,client_count,last_dts,url,lifetime],
   Stats = [{K,V} || {K,V} <- Attrs, lists:member(K,Keys)],
   flu_event:stream_stopped(Name, Stats),
+  %HOOK API CALLBACK
+  notify_webhook(Name, "stream_stopped"),
   ok.
 
+
+notify_webhook(Name, Event) ->
+  lager:error("Notify webhook ~p ~p", [Name, Event]),
+  {match,[Prefix, Stream]} = re:run(Name,"(.*)/(.*)",[{capture,all_but_first,binary}]),
+  Env = flu_config:get_config(),
+  Options = case [Entry || {live,Pref,_Options} = Entry <- Env, Pref == Prefix] of
+  [{live, Prefix, Opts}] -> Opts;
+  [] ->
+    lager:error("Hook from invalid RTMP app ~s ~s", [Prefix, Stream]),
+    ok
+  end,
+  
+  case proplists:get_value(webhook, Options) of
+    ApiEndpoint when ApiEndpoint =/= undefined ->
+      EndPoint = binary_to_list(iolist_to_binary([ApiEndpoint, "/", Stream, "?event=", Event])),
+      case lhttpc:request(EndPoint, "GET", [], 30000) of
+        {ok,{{Code,_},_Headers,_Body}} when Code == 200 orelse Code == 302 ->
+          ok;
+        {ok,{{500,_},_Headers,_Body}} ->
+          lager:error("500 error on api: ~p", [_Body]);
+        {error, _} ->
+          lager:error("Unabled to connect to api.", [])
+      end
+  end,
+  ok.
+  
 
 %%--------------------------------------------------------------------
 %% @private
