@@ -277,6 +277,7 @@ media_info(Stream) ->
 
 % HDS
 hds_manifest(Stream) ->
+  % Called when a user connects to HDS stream
   touch(Stream),
   gen_tracker:getattr(flu_streams, Stream, hds_manifest).
 
@@ -390,13 +391,25 @@ set_source(Stream, Source) when is_pid(Stream) andalso (is_pid(Source) orelse So
   gen_server:call(Stream, {set_source, Source}).
 
 set_last_dts(DTS, Now) ->
+
   erlang:put(last_dts_at, Now),
   erlang:put(last_dts, DTS),
   FirstDTS = case erlang:get(first_dts) of
     undefined -> put(first_dts, DTS), DTS;
     FDTS -> FDTS
   end,
+
   Lifetime = DTS - FirstDTS,
+  case Lifetime of
+    Lifetime1 when Lifetime1 > 15000 ->
+      case erlang:get(already_ready) of
+        undefined -> 
+          put(already_ready, true),
+          notify_webhook(get(name), "stream_started");
+        _ -> ok
+      end;
+    _ -> ok
+  end, 
   gen_tracker:setattr(flu_streams, get(name), [{last_dts, DTS},{last_dts_at,Now},{lifetime,Lifetime}]).
 
 non_static(Stream) ->
@@ -755,7 +768,6 @@ handle_info({'DOWN', _, process, Source, _Reason},
   #stream{source = Source, retry_count = Count, name = Name, url = URL, retry_limit = Limit} = Stream) ->
   Delay = ((Count rem 30) + 1)*1000,
   erlang:send_after(Delay, self(), reconnect_source),
-  
   LogError = will_log_error(Count),
   if LogError -> lager:error("stream \"~s\" lost source \"~s\". Retry count ~p/~p", [Name, URL, Count, Limit]);
   true -> ok end,
@@ -972,9 +984,8 @@ terminate(_Reason, #stream{name = Name}) ->
 after_terminate(Name, Attrs) ->
   Keys = [hls,hds,rtmp,bytes_in,bytes_out,client_count,last_dts,url,lifetime],
   Stats = [{K,V} || {K,V} <- Attrs, lists:member(K,Keys)],
-  flu_event:stream_stopped(Name, Stats),
-  %HOOK API CALLBACK
   notify_webhook(Name, "stream_stopped"),
+  flu_event:stream_stopped(Name, Stats),
   ok.
 
 
