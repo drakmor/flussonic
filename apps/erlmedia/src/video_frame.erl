@@ -33,6 +33,9 @@
 -export([config_frame/1, config_frames/1, define_media_info/2, has_media_info/1, frame_sound/1]).
 -export([sort/1]).
 -export([meta_frame/1, meta_frame/2]).
+-export([reduce_keyframes/1]).
+
+-export([media_info_to_json/1]).
 
 
 config_frame(#stream_info{codec = aac, config = Config, track_id = TrackId}) ->
@@ -196,6 +199,7 @@ define_media_info(Media, Frames) when is_list(Frames) ->
 frame_sorter(#video_frame{dts = DTS1}, #video_frame{dts = DTS2}) when DTS1 < DTS2 -> true;
 frame_sorter(#video_frame{dts = DTS, flavor = config}, #video_frame{dts = DTS, flavor = Flavor}) when Flavor =/= config -> true;
 frame_sorter(#video_frame{dts = DTS, flavor = config, content = video}, #video_frame{dts = DTS, flavor = config, content = Content}) when Content=/= video -> true;
+frame_sorter(#video_frame{dts = DTS, content = video}, #video_frame{dts = DTS, content = Content}) when Content =/= video -> true;
 frame_sorter(#video_frame{}, #video_frame{}) -> false.
 
 sort(Frames) ->
@@ -233,5 +237,30 @@ meta_frame0(#media_info{streams = Streams, duration = Duration}, Additional) ->
   Opts = lists:ukeymerge(1, lists:keysort(1,Add), Opts2),
   #video_frame{content = metadata, body = [<<"onMetaData">>, {object, Opts}], stream_id = 0, dts = 0, pts = 0}.
   
-  
+
+
+-define(MIN_DTS_STEP, 3000).
+
+reduce_keyframes(Keyframes) ->
+  {Keyframes1, _} = lists:mapfoldl(fun
+    ({DTS,Id}, PrevDTS) when DTS - PrevDTS >= ?MIN_DTS_STEP -> {{DTS, Id}, DTS};
+    (_, PrevDTS) -> {undefined, PrevDTS}
+  end, -2*?MIN_DTS_STEP, Keyframes),
+  Keyframes2 = [{DTS, Id} || {DTS, Id} <- Keyframes1],
+  Keyframes2.
+
+
+media_info_to_json(#media_info{duration = D, streams = Streams}) ->
+  Video = lists:keyfind(video, #stream_info.content, Streams),
+  case D of
+    undefined -> [];
+    _ -> [{duration,D}]
+  end ++ case Video of
+    #stream_info{params = #video_params{width = W, height = H}} -> [{width,W},{height,H}];
+    _ -> []
+  end.
+
+
+
+
 

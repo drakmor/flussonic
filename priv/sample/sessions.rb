@@ -4,14 +4,28 @@ require 'rubygems'
 require 'rack'
 require 'thin'
 require 'net/http'
+require 'digest/md5'
 
 
-Sessions = {}
+SECRET = "SOME_SECRET_KEY"
 
 class MainPage
+  def generate_token(name, ip, user_id)
+    expire = Time.now.to_i + 600
+    salt = rand(1000)
+    hash = Digest::MD5.hexdigest("#{expire}:#{salt}:#{name}:#{ip}:#{user_id}:#{SECRET}")
+    "#{expire}:#{user_id}:#{salt}:#{hash}"
+  end
+
+
   def call(env)
-    session = rand(100000000).to_s
-    Sessions[session] = Time.now + 60
+    query = Rack::Utils.parse_query(env["QUERY_STRING"])
+    req = Rack::Request.new(env)
+    user_id = (query["user_id"] || 15).to_i
+    path = query["path"] || "securevod/bunny.mp4"
+    token = query["token"] || generate_token(path, req.ip, user_id)
+    return [302, {"Location" => "/?path=#{path}&token=#{token}"}, []] unless query["token"]
+    streamer = query["streamer"] || "localhost:8080"
     body = <<-EOF
 <html>
 <head>
@@ -20,19 +34,24 @@ class MainPage
 <script src="http://localhost:8080/flu/js/swfobject.js" type="text/javascript"></script>
 </head>
 <body>
+
+<a href="/?path=#{path}">Regenerate token</a><br>
+
 <div id="video1" style="width:640px;height:480px">
   Video should be here, replacing this text
 </div>
 
+<!--
 <div id="video2" style="width:640px;height:480px">
   Video should be here, replacing this text
 </div>
+-->
 
 <script type="text/javascript">
 
-function player(element, session) {
+function player(element, token) {
 var flashvars = {
-  src : "http://localhost:8080/securevod/bunny.mp4/manifest.f4m?session="+session,
+  src : "http://#{streamer}/#{path}/manifest.f4m?token="+token,
   autoPlay: true
 };
 var paramObj = {allowScriptAccess : "always", allowFullScreen : "true", allowNetworking : "all"};
@@ -41,8 +60,8 @@ swfobject.embedSWF("http://localhost:8080/flu/StrobeMediaPlayback.swf", element,
 
 }
 
-player("video1", "#{session}");
-player("video2", "invalid");
+player("video1", "#{token}");
+// player("video2", "invalid");
 </script>
 </body>
 </html>
@@ -52,22 +71,32 @@ player("video2", "invalid");
 end
 
 class AuthPage
+  def validate_token(token, name, ip)
+    expire, user_id, salt, hash = token.split(":")
+    expire = expire.to_i
+    return :expired if expire < Time.now.to_i
+    user_id = user_id.to_i
+    good_hash = Digest::MD5.hexdigest("#{expire}:#{salt}:#{name}:#{ip}:#{user_id}:#{SECRET}")
+    if good_hash != hash
+      return :invalid_hash
+    end
+    {:user_id => user_id, :expire => expire}
+  end
+
   def call(env)
     query = Rack::Utils.parse_query(env["QUERY_STRING"])
+    req = Rack::Request.new(env)
     token = query["token"]
-    return [403, {}, ["no token\n"]] if !token
-    expire_at = Sessions[token]
+    name = query["name"]
+    ip = req.ip
 
-    if !expire_at
-      return [403, {}, ["session not found\n"]]
+    puts token.inspect
+    res = validate_token(token, name, ip)
+    if res.is_a?(Hash)
+      [200, {"X-AuthDuration" => "4000", "X-Unique" => "true", "X-UserId" => res[:user_id].to_s}, ["accepted\n"]]
+    else
+      [403, {}, ["forbidden: #{res}\n"]]
     end
-
-    if expire_at < Time.now
-      Sessions.delete(token)
-      return [403, {}, ["session expired\n"]]
-    end
-
-    [200, {"X-AuthDuration" => "4000"}, ["accepted\n"]]
   end
 end
 

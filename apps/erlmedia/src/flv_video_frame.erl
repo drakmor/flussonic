@@ -93,7 +93,7 @@ tag_to_video_frame(#flv_audio_tag{codec = Codec, rate = _Rate, bitsize = _Size, 
                % sound = {Channels, Size, Rate},
                pts = 0,
                dts = 0,
-               track_id = 200,
+               track_id = 2,
                body = Body};
 
 
@@ -103,7 +103,7 @@ tag_to_video_frame(#flv_video_tag{codec = Codec, flavor = Flavor, composition_ti
                codec = Codec,
                pts = CTime,
                dts = 0,
-               track_id = 201,
+               track_id = 1,
                body = Body};
 
 
@@ -151,10 +151,10 @@ to_tag(#video_frame{content = Content, stream_id = StreamId, dts = DTS1} = Frame
   DTS = round(DTS1),
   % By spec StreamId MUST be 0. But fuck the spec, we need this streamid
   Body = encode(Frame),
-	BodyLength = size(Body),
+	BodyLength = iolist_size(Body),
 	<<TimeStampExt:8,TimeStamp:24>> = <<DTS:32>>,
 	PrevTagSize = BodyLength + 11,
-	<<(flv:frame_format(Content)):8,BodyLength:24,TimeStamp:24,TimeStampExt:8,StreamId:24,Body/binary,PrevTagSize:32>>.
+	[<<(flv:frame_format(Content)):8,BodyLength:24,TimeStamp:24,TimeStampExt:8,StreamId:24>>,Body,<<PrevTagSize:32>>].
 
 
 -include_lib("eunit/include/eunit.hrl").

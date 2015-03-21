@@ -7,14 +7,14 @@
 -include("log.hrl").
 
 -export([start_link/2, start_link/3]).
--export([init/1, handle_info/2, terminate/2]).
+-export([init/1, handle_info/2, handle_call/3, terminate/2]).
 
 
 start_link(RTMP, Stream) ->
-  gen_server:start_link(?MODULE, [RTMP, Stream, []], []).
+  start_link(RTMP, Stream, []).
 
 start_link(RTMP, Stream, Options) ->
-  gen_server:start_link(?MODULE, [RTMP, Stream, Options], []).
+  proc_lib:start_link(?MODULE, init, [[RTMP, Stream, Options]]).
 
 -record(proxy, {
   rtmp,
@@ -22,25 +22,38 @@ start_link(RTMP, Stream, Options) ->
   media_info,
   start_spec,
   delaying = true,
+  flv,
   options = [],
   delayed = []
 }).
 
--define(VIDEO, 200).
--define(AUDIO, 201).
--define(META, 202).
+-define(VIDEO, 1).
+-define(AUDIO, 2).
+-define(META, 3).
 
 -define(LIMIT, 100).
 
--define(START_FRAMES, 5).
+-define(START_FRAMES, 25).
 
 init([StartSpec, Stream, Options]) ->
-  put(flu_name, publish_proxy),
-  self() ! init,
-  erlang:monitor(process, Stream),
-  {ok, #proxy{start_spec = StartSpec, stream = Stream, options = Options}}.
+  FLV = case proplists:get_value(flv, Options) of
+    undefined -> undefined;
+    RecordPath ->
+      filelib:ensure_dir(RecordPath),
+      case file:open(RecordPath, [binary,write,raw]) of
+        {ok, F} ->
+          file:write(F, flv:header()),
+          F;
+        {error, Reason} ->
+          lager:info("Failed to open ~s for writing: ~p", [RecordPath, Reason]),
+          undefined
+      end
+  end,
 
-handle_info(init, #proxy{start_spec = StartSpec, options = Options} = Proxy) ->
+  proc_lib:init_ack({ok, self()}),
+  put(flu_name, {publish_proxy, Stream}),
+  erlang:monitor(process, Stream),
+
   RTMP = if
     is_pid(StartSpec) ->
       erlang:monitor(process, StartSpec),
@@ -51,8 +64,8 @@ handle_info(init, #proxy{start_spec = StartSpec, options = Options} = Proxy) ->
           erlang:monitor(process, Pid),
           Pid;
         {error, Error} ->
-          ?ERR("Failed to connect to upstream: ~p", [Error]),
-          throw({stop, normal, Proxy})
+          lager:error("Failed to connect to upstream: ~p", [Error]),
+          {error, Error}
       end;
     is_list(StartSpec) orelse is_binary(StartSpec) ->
       case rtmp_lib:play(StartSpec, Options) of
@@ -60,13 +73,28 @@ handle_info(init, #proxy{start_spec = StartSpec, options = Options} = Proxy) ->
           erlang:monitor(process, Pid),
           Pid;
         {error, Error} ->
-          ?ERR("Failed to connect to \"~s\": ~p", [StartSpec, Error]),
-          throw({stop, normal, Proxy})
+          lager:error("Failed to connect to \"~s\": ~p", [StartSpec, Error]),
+          {error, Error}
       end;
     StartSpec == undefined ->
       undefined
   end,
-  {noreply, Proxy#proxy{rtmp = RTMP}};
+  case RTMP of
+    {error, _} = StartError ->
+      StartError;
+    _ ->
+      gen_server:enter_loop(?MODULE, [], #proxy{rtmp = RTMP, options = Options, stream = Stream, flv = FLV})
+  end.
+
+
+
+handle_call(sync, _From, #proxy{} = Proxy) ->
+  {reply, ok, Proxy};
+
+handle_call(#video_frame{} = Frame, _From, #proxy{} = Proxy) ->
+  Proxy1 = handle_frame(Frame, Proxy),
+  {reply, ok, Proxy1}.
+
 
 handle_info({set_source, RTMP}, #proxy{rtmp = undefined} = Proxy) ->
   erlang:monitor(process, RTMP),
@@ -89,7 +117,9 @@ handle_info(#media_info{streams = Streams} = MI1, #proxy{media_info = undefined,
 % handle_info({rtmp, _RTMP, #rtmp_message{type = video, body = <<23,2,0,0,0>>}}, Stream) ->
 %   {noreply, Stream};
 % 
-handle_info({rtmp, _RTMP, #rtmp_message{type = Type, timestamp = Timestamp, body = Body}}, Proxy) when (Type == audio orelse Type == video) andalso size(Body) > 0 ->
+handle_info({rtmp, _RTMP, #rtmp_message{type = Type, timestamp = Timestamp, body = Body}}, #proxy{} = Proxy) 
+  when (Type == audio orelse Type == video) andalso size(Body) > 0 ->
+
   case flv_video_frame:decode(#video_frame{dts = Timestamp, pts = Timestamp, content = Type}, Body) of
     #video_frame{flavor = Flavor} = Frame when Flavor == keyframe orelse Flavor == frame orelse Flavor == config ->
       handle_info(Frame, Proxy);
@@ -101,6 +131,12 @@ handle_info({rtmp, _RTMP, #rtmp_message{type = Type}}, Proxy) when Type == burst
   {noreply, Proxy};
 
 handle_info({rtmp, _RTMP, #rtmp_message{type = metadata}}, Proxy) ->
+  {noreply, Proxy};
+
+handle_info({rtmp, _RTMP, #rtmp_message{type = ping}}, Proxy) ->
+  {noreply, Proxy};
+
+handle_info({rtmp, _RTMP, #rtmp_message{type = stream_begin}}, Proxy) ->
   {noreply, Proxy};
 
 handle_info({rtmp, _RTMP, disconnect, _}, Proxy) ->
@@ -116,10 +152,20 @@ handle_info({'DOWN', _, _, _, _}, #proxy{} = Proxy) ->
   {stop, normal, Proxy}.
 
 
-handle_frame(#video_frame{} = Frame, #proxy{} = Proxy) ->
+handle_frame(#video_frame{} = Frame, #proxy{flv = FLV} = Proxy) ->
   Frame1 = rewrite_track_id(Frame),
+
+  case FLV of
+    undefined -> ok;
+    _ -> 
+      case flv_video_frame:is_good_flv(Frame) of
+        true -> file:write(FLV, flv_video_frame:to_tag(Frame1));
+        _ -> ok
+      end
+  end,
+
   Proxy1 = #proxy{delayed = Delayed} = handle_frame1(Frame1, Proxy),
-  if length(Delayed) > ?LIMIT -> throw({stop, too_much_delayed_frames, Proxy1#proxy{delayed = []}});
+  if length(Delayed) > ?LIMIT -> throw({stop, too_much_delayed_frames, Proxy1#proxy{delayed = length(Delayed)}});
     true -> Proxy1
   end.
 
@@ -180,7 +226,7 @@ handle_frame1({metadata, Meta1, Frame}, #proxy{media_info = undefined, delayed =
 handle_frame1(#video_frame{} = Frame, #proxy{media_info = MI1, delaying = true, delayed = Delayed, stream = Stream} = Proxy) ->
 
   MI2 = video_frame:define_media_info(MI1, Frame),
-  Delaying = not video_frame:has_media_info(MI2) orelse length(Delayed) =< ?START_FRAMES,
+  Delaying = length(MI2#media_info.streams) < 2 andalso length(Delayed) =< ?START_FRAMES,
   
   Delayed1 = Delayed ++ [Frame],
   case Delaying of

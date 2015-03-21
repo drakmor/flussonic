@@ -27,7 +27,7 @@
 
 %% Application callbacks
 -export([start/2, stop/1]).
--export([load_config/0, unload_config/0]).
+-export([read_config/0, load_config/0]).
 % -export([current_cowboy_port/1]).
 -include("log.hrl").
 
@@ -35,15 +35,7 @@
 %% Application callbacks
 %% ===================================================================
 
-start(_StartType, _StartArgs) ->
-	gen_tracker_sup:start_tracker(flu_files),
-	gen_tracker_sup:start_tracker(flu_streams),
-  % flu_session:start(),
-  
-  % sync:go(),
-  inets:start(),
-  inets:start(httpc, [{profile,auth}]),
-  httpc:set_options([{max_sessions,20},{max_keep_alive_length,100}]),
+start(_StartType, _StartArgs) ->  
   {ok, Pid} = flussonic_sup:start_link(),
   {ok, Pid}.
   
@@ -51,10 +43,6 @@ start(_StartType, _StartArgs) ->
 stop(_State) ->
   ok.
 
-
-unload_config() ->
-  flu_event:remove_handler(flu_session_log),
-  ok.
 
 
 
@@ -73,68 +61,54 @@ unload_config() ->
 %   [_Count, cowboy_tcp_transport, Opts|_] = A,
 %   proplists:get_value(port, Opts).
 
-load_config() ->
+
+read_config() ->
   case flu_config:load_config() of
     {ok, Env1, ConfigPath} ->
       flu_config:set_config(Env1),
-      {ok, Vsn} = application:get_key(flussonic, vsn),
-	    error_logger:info_msg("Loading config for version ~s from ~s", [Vsn, ConfigPath]),
-	    ok;
+      application:load(flussonic),
+      Vsn = case application:get_key(flussonic, vsn) of
+        {ok, V} -> V;
+        undefined -> undefined
+      end,
+      case application:get_env(flussonic, config) of
+        undefined -> error_logger:info_msg("Loading config for version ~s from ~s", [Vsn, ConfigPath]);
+        {ok, _} -> ok
+      end,
+      flu_config:get_config();
     {error, enoent} ->
       error_logger:error_msg("Can't find flussonic.conf in any folder~n"),
-      timer:sleep(2000),
-      erlang:halt(1);
+      throw(invalid_config);
+    {error, {Line,erl_parse,Message}} ->
+      error_logger:error_msg("flussonic.conf has invalid syntax on line ~B. Error is: ~s, but is may be earlier~n", [Line,Message]),
+      throw(invalid_config);
     {error, Else} ->
       error_logger:error_msg("Can't open flussonic.conf: ~p~n", [Else]),
-      timer:sleep(2000),
-      erlang:halt(1)
-	end,  
-  Env = flu_config:get_config(),
-  Routes = flu_config:parse_routes(Env),
-  Dispatch = [{'_', Routes}],
-  {http, HTTPPort} = lists:keyfind(http, 1, Env),
-  application:start(cowboy),
+      throw(invalid_config)
+  end.
 
+load_config() ->
+  OldConfig = flu_config:get_config(),
+  Env = read_config(),
+  LogLevel = proplists:get_value(loglevel, Env, info),
+  lager:set_loglevel(lager_console_backend, LogLevel),
+  lager:set_loglevel(lager_file_backend, LogLevel),
 
-  ProtoOpts = [{dispatch, Dispatch},{max_keepalive,4096}],
-  
-  stop_http(flu_http),
-  start_http(flu_http, 100, 
-    [{port,HTTPPort},{backlog,4096},{max_connections,8192}],
-    ProtoOpts
-  ),
+  flu:start_webserver(Env),
 
-  % (catch cowboy:stop_listener(http)),
-  % TODO move from cowboy supervisor tree to flussonic supervisor tree
-  % cowboy:start_listener(http, 100, 
-  %   cowboy_tcp_transport, [{port,HTTPPort},{backlog,4096},{max_connections,8192}],
-  %   cowboy_http_protocol, ProtoOpts
-  % ),
-  % end,
-  
-  
-  [flu_stream:update_options(Stream, [{url,URL}|StreamOpts]) || {stream, Stream, URL, StreamOpts} <- Env],
-  ConfigStreams = [Stream || {stream, Stream, _URL, _StreamOpts} <- Env],
-  [flu_stream:non_static(Name) || {Name, _} <- flu_stream:list(), not lists:member(Name, ConfigStreams)],
-  
   
   case proplists:get_value(rtmp, Env) of
-    undefined -> ok;
+    undefined -> rtmp_socket:stop_server(rtmp_listener1);
     RTMPPort ->
-	  	?D({"Start RTMP server at port", RTMPPort}),
+	  	lager:notice("Start RTMP server at port ~B", [RTMPPort]),
   	  rtmp_socket:start_server(RTMPPort, rtmp_listener1, flu_rtmp)
   end,
   case proplists:get_value(rtsp, Env) of
-	  undefined -> ok;
+	  undefined -> rtsp:stop_server(rtsp_listener1);
 	  RTSPPort ->
-	    ?D({"Start RTSP server at port", RTSPPort}),
+	    lager:notice("Start RTSP server at port ~B", [RTSPPort]),
 	    rtsp:start_server(RTSPPort, rtsp_listener1, flu_rtsp)
 	end,
-
-  case proplists:get_value(sessions_log, Env) of
-    undefined -> ok;
-    SessionLog -> flu_event:add_handler(flu_session_log, SessionLog)
-  end,
 
   [begin
     (catch Plugin:module_info()),
@@ -143,12 +117,16 @@ load_config() ->
       false -> ok
     end
   end || {plugin, Plugin, Options} <- flu_config:get_config()],
+
+  flu_event:start_handlers(),
+
+  [catch flu_stream:update_options(Stream, [{url,URL}|StreamOpts]) || {stream, Stream, URL, StreamOpts} <- Env],
+  ConfigStreams = [Stream || {stream, Stream, _URL, _StreamOpts} <- Env],
+  OldStreams = [Stream || {stream, Stream, _, _} <- OldConfig, not lists:member(Stream, ConfigStreams)],
+  [catch flu_stream:non_static(Name) || {Name, _} <- flu_stream:list(), not lists:member(Name, ConfigStreams)],
+  [catch flu_stream:stop(Name) || {Name, _} <- flu_stream:list(), lists:member(Name, OldStreams)],
+
+
   ok.
 
 
-start_http(Ref, NbAcceptors, TransOpts, ProtoOpts)
-    when is_integer(NbAcceptors) ->
-  cowboy:start_http(Ref, NbAcceptors, TransOpts, ProtoOpts).
-
-stop_http(Ref) ->
-  cowboy:stop_listener(Ref).

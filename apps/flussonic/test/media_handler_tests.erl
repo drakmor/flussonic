@@ -41,59 +41,43 @@ media_handler_test_() ->
     ,{"test_archive_mpeg_file", fun test_archive_mpeg_file/0}
     ,{"test_archive_timeshift_abs", fun test_archive_timeshift_abs/0}
     ,{"test_archive_timeshift_rel", fun test_archive_timeshift_rel/0}
+
+
+    ,{"test_wrong_path1", fun test_wrong_path1/0}
   ]}.
 
 
 test_lookup_by_path(Path) -> catch test_lookup_by_path0(Path).
 
 test_lookup_by_path0(Path) when is_list(Path) -> test_lookup_by_path0(list_to_binary(Path));
-test_lookup_by_path0(<<"/", Path/binary>>) -> test_lookup_by_path0(Path);
-test_lookup_by_path0(Path1) when is_binary(Path1) ->
+test_lookup_by_path0(<<"/",_/binary>> = Path1) ->
   Routes = flu_config:parse_routes(flu_config:get_config()),
+  Dispatch = cowboy_router:compile([{'_', Routes}]),
   {Path,Query} = case binary:split(Path1, <<"?">>) of
     [P,Q] -> {P,Q};
     [P] -> {P,<<"">>}
   end,
-  {Options, PathInfo} = try select_route(Routes, binary:split(Path, <<"/">>, [global]))
-  catch throw:{no_route_found,PI} -> throw({no_route_found,flu_config:get_config(),Routes,PI})
-  end,
-  Req = cowboy_req:new(socket, fake_inet, <<"GET">>, Path, Query, fragment, version,
-    [{<<"x-real-ip">>,<<"127.0.0.1">>}], host, port, buffer, false, undefined),
+  % {Options, PathInfo} = try select_route(Routes, binary:split(Path, <<"/">>, [global]))
+  % catch throw:{no_route_found,PI} -> throw({no_route_found,flu_config:get_config(),Routes,PI})
+  % end,
+  Req1 = cowboy_req:new(socket, fake_inet, <<"GET">>, Path, Query, <<>>, {1,1},
+    [{<<"x-real-ip">>,<<"127.0.0.1">>}], <<"erlyvideo">>, 9090, <<>>, false, undefined, undefined),
+  {ok, Req2, Env} = cowboy_router:execute(Req1, [{dispatch,Dispatch}]),
 
-  media_handler:lookup_name(PathInfo, Options, Req, []).
+  {handler,media_handler} = lists:keyfind(handler,1,Env),
+  {_,Options} = lists:keyfind(handler_opts,1,Env),
+  PathInfo = cowboy_req:get(path_info,Req2),
 
-select_route([{Prefix, _, Options}|Routes], PathInfo) ->
-  case try_prefix(Prefix, PathInfo) of
-    false ->
-      select_route(Routes, PathInfo);
-    PI1 ->
-      {Options, PI1}
-  end;
+  media_handler:lookup_name(PathInfo, Options, Req2, []);
 
-select_route([], PathInfo) -> throw({no_route_found, PathInfo}).
+test_lookup_by_path0(Path) ->
+  test_lookup_by_path0(<<"/", Path/binary>>).
 
-
-try_prefix([P|P1], [P|P2]) -> try_prefix(P1, P2);
-try_prefix(['...'], P2) -> P2;
-try_prefix([], []) -> [];
-try_prefix(_, _) -> false.
 
 set_config(Config) ->
   {ok, Config2} = flu_config:parse_config(Config, undefined),
   meck:expect(flu_config, get_config, fun() -> Config2 end).
 
-try_prefix_test_() ->
-  [?_assertEqual(false, try_prefix([<<"l1">>], [<<"l2">>])),
-  ?_assertEqual(false, try_prefix([<<"l1">>], [<<"l1">>,<<"l2">>])),
-  ?_assertEqual([<<"l2">>], try_prefix([<<"l1">>, '...'], [<<"l1">>,<<"l2">>])),
-  ?_assertEqual([], try_prefix([<<"l1">>, <<"l2">>], [<<"l1">>,<<"l2">>]))
-  ].
-
-select_route_test_() ->
-  [?_assertEqual({options1, []}, select_route([{[<<"l1">>],h, options1}], [<<"l1">>])),
-  ?_assertEqual({options1, [<<"l2">>]}, select_route([{[<<"l1">>, '...'],h, options1}, {[<<"l1">>,<<"l2">>],h, options2}], [<<"l1">>, <<"l2">>])),
-  ?_assertEqual({options2, []}, select_route([{[<<"l1">>,<<"l2">>],h, options2}, {[<<"l1">>, '...'],h, options1}], [<<"l1">>, <<"l2">>]))
-  ].
 
 test_offline_stream_playlist() ->
   set_config([{stream, "livestream", "fake://url", [{dvr, <<"test/files">>}]}]),
@@ -109,13 +93,13 @@ test_offline_rewrite_playlist() ->
 
 test_live_dvr_playlist() ->
   set_config([{live, "live", [{dvr, <<"test/files">>}]}]),
-  ?assertMatch({{hls_dvr_packetizer, playlist, [<<"test/files">>,1234567,3600]}, _, <<"livestream">>}, 
+  ?assertMatch({{hls_dvr_packetizer, playlist, [<<"test/files">>,1234567,3600]}, _, <<"live/livestream">>}, 
     test_lookup_by_path("/live/livestream/index-1234567-3600.m3u8")).
 
 
 test_offline_live_dvr_ts() ->
   set_config([{live, "live", [{dvr, <<"test/files">>}]}]),
-  ?assertMatch({{dvr_handler, mpeg_file, [<<"test/files">>,1348748644,3600, _]}, [], <<"livestream">>}, 
+  ?assertMatch({{dvr_handler, mpeg_file, [<<"test/files">>,1348748644,3600, _]}, [], <<"live/livestream">>}, 
     test_lookup_by_path("/live/livestream/archive-1348748644-3600.ts")).
 
 
@@ -128,7 +112,7 @@ test_live_hds_manifest() ->
 
 
 test_live_hds_manifest_with_auth() ->
-  meck:expect(media_handler, check_sessions, fun(_,_,_) -> {ok, {<<"chan0">>, <<"a">>}} end),
+  meck:expect(media_handler, check_sessions, fun(_,_,_) -> {ok, <<"a">>} end),
   set_config([{stream, "chan0", "udp://1", [{sessions, "http://127.0.0.1:8080/"}]}]),
   ?assertMatch({{flu_stream, hds_manifest, [<<"a">>]}, _, <<"chan0">>},
     test_lookup_by_path("/chan0/manifest.f4m")).
@@ -193,7 +177,7 @@ test_archive_dvr_event_manifest() ->
     test_lookup_by_path("/livestream/archive/1234567/now/manifest.f4m")).  
 
 test_archive_dvr_event_manifest_with_auth() ->
-  meck:expect(media_handler, check_sessions, fun(_,_,_) -> {ok, {<<"livestream">>, <<"a">>}} end),
+  meck:expect(media_handler, check_sessions, fun(_,_,_) -> {ok, <<"a">>} end),
   set_config([{stream, "livestream", "fake://url", [{dvr, <<"test/files">>},{sessions,"http://127.0.0.1:8080"}]}]),
   ?assertMatch({{dvr_session, hds_manifest, [<<"test/files">>,1234567,now, <<"a">>]}, _, <<"livestream">>},
     test_lookup_by_path("/livestream/archive/1234567/now/manifest.f4m")).  
@@ -237,6 +221,10 @@ test_archive_timeshift_rel() ->
     test_lookup_by_path("/livestream/timeshift_rel/1234567")).  
 
 
+
+test_wrong_path1() ->
+  set_config([{stream, "chan0", "fake://url", []}]),
+  ?assertMatch({return, 415, _}, test_lookup_by_path("/chan0/archive/1359421400/manifest.f4m")).
 
 
 

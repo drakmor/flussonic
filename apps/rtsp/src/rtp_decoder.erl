@@ -43,7 +43,8 @@
 
 
 -record(h264_buffer, {
-  time,
+  dts,
+  ctime,
   buffer
 }).
 
@@ -55,57 +56,64 @@ init(#stream_info{codec = Codec, timescale = Scale} = Stream) ->
 sync(#rtp_channel{} = RTP, Headers) ->
   Seq = proplists:get_value(seq, Headers),
   Time = proplists:get_value(rtptime, Headers),
-  % ?D({sync, Headers}),
   RTP#rtp_channel{wall_clock = 0, timecode = Time, sequence = Seq}.
 
+
+
+
 decode(_, #rtp_channel{timecode = TC, wall_clock = Clock} = RTP) when TC == undefined orelse Clock == undefined ->
-  %% ?D({unsynced, RTP}),
   {ok, RTP#rtp_channel{timecode = 0, wall_clock = 0, sequence = 0}, []};
 
 decode(<<_:16, Sequence:16, _/binary>> = Data, #rtp_channel{sequence = undefined} = RTP) ->
   decode(Data, RTP#rtp_channel{sequence = Sequence});
 
-decode(<<_:16, OldSeq:16, _/binary>> = Data, #rtp_channel{sequence = Sequence} = RTP) when OldSeq < Sequence ->
-  ?D({drop_sequence, OldSeq, Sequence}),
-  decode(Data, RTP#rtp_channel{sequence = undefined});
-  % {ok, RTP, []};
+decode(<<_:16, OldSeq:16, _/binary>> = Data, #rtp_channel{sequence = Sequence, warning_count = WarningCount} = RTP) when OldSeq < Sequence ->
+  if WarningCount < 10 -> ?D({drop_sequence, OldSeq, Sequence});
+  true -> ok end,
+  decode(Data, RTP#rtp_channel{sequence = undefined, warning_count = WarningCount + 1});
 
-decode(<<2:2, 0:1, _Extension:1, 0:4, _Marker:1, _PayloadType:7, Sequence:16, Timecode:32, _StreamId:32, Data/binary>>, #rtp_channel{} = RTP) ->
-  decode(Data, RTP#rtp_channel{sequence = (Sequence + 1) rem 65536}, Timecode);
+decode(<<2:2, 0:1, Extension:1, 0:4, _Marker:1, _PayloadType:7, Sequence:16, Timecode:32, _StreamId:32, Data1/binary>>, #rtp_channel{} = RTP) ->
+  {Data, CTime} = ctime(Data1, Extension),
+  % ?debugFmt("ext: ~p, ~p, ~p, ~p", [RTP#rtp_channel.codec, Extension, CTime, Timecode]),
+  decode(Data, RTP#rtp_channel{sequence = (Sequence + 1) rem 65536}, Timecode, CTime);
 
-decode(<<2:2, 1:1, _Extension:1, 0:4, _Marker:1, _PayloadType:7, Sequence:16, Timecode:32, _StreamId:32, BigData/binary>>, #rtp_channel{} = RTP) ->
+decode(<<2:2, 1:1, Extension:1, 0:4, _Marker:1, _PayloadType:7, Sequence:16, Timecode:32, _StreamId:32, BigData/binary>>, #rtp_channel{} = RTP) ->
   SizeOffset = size(BigData) - 1,
   <<_:SizeOffset/binary, PaddingSize>> = BigData,
   DataLen = size(BigData) - PaddingSize,
-  <<Data:DataLen/binary, _:PaddingSize/binary>> = BigData,
-  decode(Data, RTP#rtp_channel{sequence = (Sequence + 1) rem 65536}, Timecode).
+  <<Data1:DataLen/binary, _:PaddingSize/binary>> = BigData,
+  {Data, CTime} = ctime(Data1, Extension),
+  decode(Data, RTP#rtp_channel{sequence = (Sequence + 1) rem 65536}, Timecode, CTime).
+
+
+
 
 
 decode(<<AULength:16, AUHeaders:AULength/bitstring, AudioData/binary>>, #rtp_channel{codec = aac, 
-  stream_info = #stream_info{track_id = TrackId}} = RTP, Timecode) ->
+  stream_info = #stream_info{track_id = TrackId}} = RTP, Timecode, 0) ->
   Frames = decode_aac(AudioData, AUHeaders, RTP, Timecode),
   {ok, RTP, [F#video_frame{track_id = TrackId} || F <- Frames]};
 
-decode(Body, #rtp_channel{codec = h264, buffer = Buffer, stream_info = #stream_info{track_id = TrackId}} = RTP, Timecode) ->
+decode(Body, #rtp_channel{codec = h264, buffer = Buffer, timescale = Scale, stream_info = #stream_info{track_id = TrackId}} = RTP, Timecode, CTime) ->
   DTS = timecode_to_dts(RTP, Timecode),
-  {ok, Buffer1, Frames} = decode_h264(Body, Buffer, DTS),
+  {ok, Buffer1, Frames} = decode_h264(Body, Buffer, DTS, CTime / Scale),
   % ?D({decode,h264,Timecode,DTS, length(Frames), size(Body), size(Buffer1#h264_buffer.buffer)}),
   {ok, RTP#rtp_channel{buffer = Buffer1}, [F#video_frame{track_id = TrackId} || F <- Frames]};
 
-decode(Body, #rtp_channel{codec = mpegts, buffer = undefined} = RTP, Timecode) ->
+decode(Body, #rtp_channel{codec = mpegts, buffer = undefined} = RTP, Timecode, 0) ->
   {ok, Decoder} = mpegts_decoder:init(),
-  decode(Body, RTP#rtp_channel{buffer = Decoder}, Timecode);
+  decode(Body, RTP#rtp_channel{buffer = Decoder}, Timecode, 0);
 
-decode(Body, #rtp_channel{codec = mpegts, buffer = Decoder} = RTP, _Timecode) ->
+decode(Body, #rtp_channel{codec = mpegts, buffer = Decoder} = RTP, _Timecode, 0) ->
   {ok, Decoder1, Frames} = mpegts_decoder:decode(Body, Decoder),
   {ok, RTP#rtp_channel{buffer = Decoder1}, Frames};
 
-decode(Body, #rtp_channel{stream_info = #stream_info{codec = Codec, content = Content, track_id = TrackId}} = RTP, Timecode) ->
+decode(Body, #rtp_channel{stream_info = #stream_info{codec = Codec, content = Content, track_id = TrackId}} = RTP, Timecode, CTime) ->
   DTS = timecode_to_dts(RTP, Timecode),
   Frame = #video_frame{
     content = Content,
     dts     = DTS,
-    pts     = DTS,
+    pts     = DTS + CTime,
     body    = Body,
 	  codec	  = Codec,
 	  flavor  = frame,
@@ -114,31 +122,20 @@ decode(Body, #rtp_channel{stream_info = #stream_info{codec = Codec, content = Co
   {ok, RTP, [Frame]}.
 
 
+ctime(Data, 0) -> {Data,0};
+ctime(<<7:16, 1:16, CTime:32, Data/binary>>, 1) -> {Data, CTime}.
 
-% FIXME:
-% Тут надо по-другому. 
-% Надо аккумулировать все RTP-пейлоады с одним Timecode
-% Потом проходить по ним депакетизатором FUA. Отрефакторить это в h264 в depacketize
-% Потом взять результирующие NAL-юниты, склеить их в один или два кадра.
-% SPS, PPS оформить в конфиг, остальное положить в один кадр. Бевард зачем-то шлет два полукадра.
-%
-% decode_h264(Body, OldDts, OldDts) -> accumulate
-% decode_h264(NewBody, OldDts, NewDts) ->
-%   depacketize(Accum)
-%   split_into_frames(NALS)
-%   flush_buffer
-%   accumulate(Body, NewDts)
-%   return_frames_and_new_buffer
-%
 
-decode_h264(Body, undefined, DTS) ->
-  {ok, #h264_buffer{time = DTS, buffer = [Body]}, []};
 
-decode_h264(Body, #h264_buffer{time = DTS, buffer = Buffer} = H264, DTS) ->
+decode_h264(Body, undefined, DTS, CTime) ->
+  {ok, #h264_buffer{dts = DTS, ctime = CTime, buffer = [Body]}, []};
+
+decode_h264(Body, #h264_buffer{dts = DTS, buffer = Buffer} = H264, DTS, _CTime) ->
   {ok, H264#h264_buffer{buffer = [Body|Buffer]}, []};
 
-decode_h264(Body, #h264_buffer{time = OldDTS, buffer = Buffer}, DTS) when OldDTS =/= DTS ->
-  {ok, #h264_buffer{time = DTS, buffer = [Body]}, h264:unpack_rtp_list(lists:reverse(Buffer), OldDTS)}.
+decode_h264(Body, #h264_buffer{dts = OldDTS, ctime = OldCTime, buffer = Buffer}, DTS, CTime) when OldDTS =/= DTS ->
+  {ok, #h264_buffer{dts = DTS, ctime = CTime, buffer = [Body]}, 
+    [F#video_frame{pts = D + OldCTime} || #video_frame{dts = D} = F <- h264:unpack_rtp_list(lists:reverse(Buffer), OldDTS)]}.
 
 
 
@@ -146,8 +143,13 @@ decode_aac(<<>>, <<>>, _RTP, _) ->
   [];
 
 decode_aac(AudioData, <<AUSize:13, _Delta:3, AUHeaders/bitstring>>, RTP, Timecode) ->
-  <<Body:AUSize/binary, Rest/binary>> = AudioData,
+  <<Body1:AUSize/binary, Rest/binary>> = AudioData,
   DTS = timecode_to_dts(RTP, Timecode),
+  % Some cameras pack aac to adts. Check it
+  Body = case Body1 of
+    <<16#FFF:12, _/bitstring>> -> {ok, AAC, <<>>} = aac:unpack_adts(Body1), AAC;
+    _ -> Body1
+  end,
   Frame = #video_frame{
     content = audio,
     dts     = DTS,

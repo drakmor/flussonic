@@ -49,6 +49,7 @@
 
 -export([read/2]).
 -export([padder/0]).
+-export([null/1]).
 
 
 -define(TS_PACKET, 184). % 188 - 4 bytes of header
@@ -57,7 +58,9 @@
 
   
 read(URL, Options) ->
-  {ok, Reader} = mpegts_sup:start_reader([{consumer,proplists:get_value(consumer,Options,self())},{url, URL}|Options]),
+  Name = {proplists:get_value(name, Options), URL},
+  Consumer = proplists:get_value(consumer,Options,self()),
+  {ok, Reader} = mpegts_sup:start_reader(Name, [{url,URL},{consumer,Consumer}|Options]),
   case (catch gen_server:call(Reader, connect)) of
     ok -> {ok, Reader};
     {error, _} = Error -> Error;
@@ -72,7 +75,8 @@ read(URL, Options) ->
   pcr_pid,
   closing = false,
   resync_on_keyframe = false,
-  last_dts
+  last_dts,
+  warning_count = 0
 }).
 
 -record(pes, {
@@ -165,13 +169,15 @@ save_media_info(#streamer{} = Streamer, #media_info{streams = Streams} = MediaIn
   PcrPid = erlang:hd([TrackId || #stream_info{track_id = TrackId} <- Streams]),
   Streamer#streamer{media_info = MediaInfo, pcr_pid = PcrPid + ?PID_OFFSET}.
 
-encode_frame(#streamer{media_info = #media_info{streams = Infos}} = Streamer, 
+encode_frame(#streamer{media_info = #media_info{streams = Infos}, warning_count = WarningCount} = Streamer, 
              #video_frame{track_id = TrackId, next_id = NextId, content = Content} = Frame) when Content == audio orelse Content == video ->
   Closing = NextId == last_frame,
   case lists:keyfind(TrackId, #stream_info.track_id, Infos) of
     false ->
-      ?D({unknown_mpegts_track, TrackId, Streamer#streamer.media_info, Frame}),
-      {Streamer, <<>>};
+      if WarningCount < 2 ->
+        ?D({unknown_mpegts_track, TrackId, Infos, {video_frame, Frame#video_frame.track_id, Frame#video_frame.codec}, get(name)});
+      true -> ok end, 
+      {Streamer#streamer{warning_count = WarningCount + 1}, <<>>};
     #stream_info{} = Info ->
       #pes{} = PES = pack_pes(Frame, Info),
       {Streamer1, TS} = mux(PES#pes{last_frame = Closing}, Streamer),
@@ -505,6 +511,12 @@ adaptation_field(#pes{body = Data, dts = Timestamp, keyframe = _Keyframe, is_pcr
   
   Field = padding(Adaptation, ?TS_PACKET - 1 - iolist_size(Data)),
   [<<(iolist_size(Field))>>, Field].
+
+
+null(Counter1) ->
+  Counter = Counter1 rem 16,
+  <<Padding:182/binary, _/binary>> = padder(),
+  [<<16#47, 0:3, 16#1FFF:13, 0:2, 1:1, 0:1, Counter:4, 182, 0>>, Padding].
 
 
   

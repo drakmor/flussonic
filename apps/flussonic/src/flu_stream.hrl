@@ -3,6 +3,7 @@
   url,
   options,
   source,
+  source_ref,  
   static = false,
   source_timeout,
   clients_timeout,
@@ -10,7 +11,6 @@
   retry_limit,
   last_dts,
   ts_delta,
-  last_access_at,
   last_dts_at,
   dump_frames,
   timeout,
@@ -18,8 +18,14 @@
   hds,
   hls,
   udp,
-  rtmp,
-  clients = [],
-  gop = undefined,
-  check_timer
+  push = [],
+  monotone,
+  check_timer,
+  gop_flush,
+  gop_open,
+  gop_start_dts,
+  gop = []
 }).
+
+-define(SEGMENT_DURATION, 3).
+

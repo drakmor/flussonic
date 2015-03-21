@@ -30,26 +30,45 @@
 -export([read/3, read2/3]).
 -export([record/3, announce/3, describe/3, play/3]).
 
+-export([list_segments/1, get_segment/2]).
+
 
 read(Stream, URL_, Options) ->
   URL = re:replace(URL_, "rtsp1://", "rtsp://", [{return,list}]),
-  {ok, Proxy} = flussonic_sup:start_stream_helper(Stream, publish_proxy, {flu_publish_proxy, start_link, [undefined, self()]}),
+  {ok, Proxy} = flu_stream:start_helper(Stream, publish_proxy, {flu_publish_proxy, start_link, [undefined, self()]}),
   {ok, RTSP, #media_info{streams = Streams} = MediaInfo} = old_rtsp_socket:read(URL, [{consumer,Proxy}|Options]),
   Proxy ! {set_source, RTSP},
   Streams1 = [Info#stream_info{track_id = TrackId + 199} || #stream_info{track_id = TrackId} = Info <- Streams],
   {ok, RTSP, MediaInfo#media_info{streams = Streams1}}.
   
 read2(Stream, URL, Options) ->
-  % {ok, Proxy} = flussonic_sup:start_stream_helper(Stream, publish_proxy, {flu_publish_proxy, start_link, [undefined, self()]}),
+  % {ok, Proxy} = flu_stream:start_helper(Stream, publish_proxy, {flu_publish_proxy, start_link, [undefined, self()]}),
   URL1 = re:replace(URL, "rtsp2://", "rtsp://", [{return,list}]),
   % {ok, RTSP} = rtsp_reader:start_link(URL1, [{consumer,self()}|Options]),
   % Proxy ! {set_source, RTSP},
-  {ok, RTSP} = flussonic_sup:start_stream_helper(Stream, rtsp_reader, {rtsp_reader, start_link, [URL1, [{consumer,self()}|Options]]}),
+  {ok, RTSP} = flu_stream:start_helper(Stream, rtsp_reader, {rtsp_reader, start_link, [URL1, [{consumer,self()}|Options]]}),
   try rtsp_reader:media_info(RTSP) of
-    {ok, MediaInfo} -> {ok, RTSP, MediaInfo}
+    {ok, #media_info{streams = Streams} = MediaInfo} -> 
+      {ok, RTSP, MediaInfo#media_info{streams = [S || #stream_info{codec = Codec} = S <- Streams, lists:member(Codec,[h264,mp3,aac])]}}
   catch
-    exit:{normal,_} -> undefined
+    exit:{normal,Reason} -> {error, Reason}
   end.
+
+
+
+
+
+
+
+
+list_segments(Stream) ->
+  flu_stream:hls_playlist(Stream).
+
+
+get_segment(Stream, Segment) ->
+  flu_stream:hls_segment(undefined, Stream, Segment).
+
+
 
 
 announce(URL, Headers, MediaInfo) ->
@@ -71,7 +90,7 @@ announce0(URL, Headers, #media_info{} = MediaInfo) ->
     [{live, _Prefix, Opts}|_] -> {_Prefix, Opts};
     [] -> []
   end,
-  
+
   {rtsp, _Auth, _Host, _Port, "/" ++ StreamName1, _Query} = http_uri2:parse(URL),
   StreamName = case re:run(StreamName1, "(.*)\\.sdp", [{capture,all_but_first,binary}]) of
     {match, [S]} -> S;
@@ -82,7 +101,7 @@ announce0(URL, Headers, #media_info{} = MediaInfo) ->
     undefined ->
       ok;
     PasswordSpec ->
-      case proplists:get_value('Authorization', Headers) of
+      case rtsp:header(authorization, Headers) of
         <<"Basic ", Basic64/binary>> ->
           Basic = binary_to_list(base64:decode(Basic64)),
           Basic == PasswordSpec orelse throw(authentication);
@@ -97,7 +116,7 @@ announce0(URL, Headers, #media_info{} = MediaInfo) ->
   gen_tracker:setattr(flu_streams, StreamName, [{play_prefix,Prefix}]),
   flu_stream:set_source(Recorder, self()),
   
-  {ok, Proxy} = flussonic_sup:start_stream_helper(StreamName, publish_proxy, {flu_publish_proxy, start_link, [self(), Recorder]}),
+  {ok, Proxy} = flu_stream:start_helper(StreamName, publish_proxy, {flu_publish_proxy, start_link, [self(), Recorder]}),
   erlang:monitor(process, Recorder),
   {ok, Proxy}.
   
@@ -123,14 +142,14 @@ media_info(Stream, Count) ->
 
 
 describe(URL, Headers, _Body) ->
-  ?D({describe,URL}),
   {rtsp, _, _Host, _Port, "/"++Path, _} = http_uri2:parse(URL),
   case Path of
     "archive" -> describe_archive(Headers);
     _ -> 
       case flu_media:find_or_open(list_to_binary(Path)) of
         {ok, {file, File}} -> {ok, flu_file:media_info(File)};
-        {ok, {stream, Stream}} -> media_info(Stream)
+        {ok, {stream, Stream}} -> media_info(Stream);
+        {error, enoent} -> lager:info("RTSP DESCRIBE 404 ~p", [Path]), {error, enoent}
       end
   end.
 
@@ -151,6 +170,7 @@ dvr_session(Headers) ->
   From = parse_time(From_),
   {_, To_} = lists:keyfind("to", 1, Headers),
   To = parse_time(To_),
+  lager:info("RTSP play ~s/~p/~p", [Name, From, To]),
   {ok, Session} = dvr_session:autostart(Name, From, To - From, [{root,Root}]),
   {ok, Session}.
 
@@ -171,7 +191,8 @@ describe_archive(Headers) ->
   % end.
 
 to_b(undefined) -> undefined;
-to_b(List) when is_list(List) -> list_to_binary(List). 
+to_b(List) when is_list(List) -> list_to_binary(List);
+to_b(Bin) when is_binary(Bin) -> Bin.
 
 play(URL, Headers, _Body) ->
   {rtsp, _, _Host, _Port, "/"++Path, _} = http_uri2:parse(URL),
@@ -182,8 +203,9 @@ play(URL, Headers, _Body) ->
 
 play_media(Path, Headers) ->
   Name = to_b(Path),
+  lager:info("RTSP play ~s", [Name]),
   Ip = to_b(proplists:get_value(ip,Headers)),
-  Token = to_b(proplists:get_value("token",Headers)),
+  Token = to_b(proplists:get_value("token",Headers, uuid:gen())),
   Identity = [{name,Name},{ip, Ip},{token,Token}],
   Params = [{pid,self()},{type,<<"rtsp">>}],
   case flu_media:find_or_open(Name, [{identity,Identity},{session,Params}]) of
@@ -191,7 +213,7 @@ play_media(Path, Headers) ->
       flu_stream:subscribe(Name),    
       {ok, {stream, Pid}};
     {ok, {file, Pid}} ->
-      {ok, _Ticker} = monotone_ticker:start_link(self(), {flu_file, read_frame, Pid}),
+      {ok, _Ticker} = monotone_ticker:start_link(self(), {flu_file, read_gop, Pid}),
       {ok, {file, Pid}};
     {error, Code} when is_integer(Code) ->
       {fail, Code, <<>>};

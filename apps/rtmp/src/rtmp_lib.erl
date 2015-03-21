@@ -22,7 +22,6 @@
 %%%---------------------------------------------------------------------------------------
 -module(rtmp_lib).
 -author('Max Lapshin <max@maxidoors.ru>').
--version(1.1).
 -include_lib("eunit/include/eunit.hrl").
 
 -include("../include/rtmp.hrl").
@@ -35,7 +34,7 @@
 -export([reply/2, reply/3, fail/2]).
 -export([notify_publish_start/4]).
 
--export([call/4]).
+-export([call/4, sync_call/4]).
 
 -define(RTMP_WINDOW_SIZE, 2500000).
 -define(FMS_VERSION, "4,0,0,1121").
@@ -126,12 +125,7 @@ connect(RTMP) when is_pid(RTMP) ->
 connect(URL) when is_list(URL) orelse is_binary(URL) ->
   case rtmp_socket:connect(URL) of
     {ok, RTMP} ->
-      receive
-        {rtmp, RTMP, connected} -> ok
-      after
-        10000 -> erlang:error({timeout,{rtmp,URL}})
-      end,
-      rtmp_socket:setopts(RTMP, [{active,true}]),
+      rtmp_socket:setopts(RTMP, [{active,true},{url,URL}]),
       connect(RTMP);
     {error, Error} ->
       erlang:error(Error)
@@ -142,20 +136,34 @@ connect(URL) when is_list(URL) orelse is_binary(URL) ->
 %% @doc Send connect request to server
 connect(RTMP, Options) ->
   {url, URL} = rtmp_socket:getopts(RTMP, url),
-  ConnectArgs = 
-   lists:ukeymerge(1, lists:ukeysort(1, Options), default_connect_options(URL)),
-  ?D({rtmp, URL, ConnectArgs}),
+  ConnectArgs = lists:ukeymerge(1, lists:ukeysort(1, Options), default_connect_options(URL)),
+  % ?debugFmt("rtmp ~p ~p", [URL, ConnectArgs]),
   AMF = #rtmp_funcall{
     command = connect,
     type = invoke,
     stream_id = 0,
     args = [{object, ConnectArgs}]
   },
-  % io:format("~p -> ~p~n", [{connect, Options}, ConnectArgs]),
   {ok, InvokeId = 1} = rtmp_socket:invoke(RTMP, AMF),
-  wait_for_reply(RTMP, InvokeId),
-  flush_onconnect_messages(RTMP),
-  {ok, RTMP}.
+  case wait_for_reply(RTMP, InvokeId) of
+    {rtmp_error, Error} ->
+      rtmp_socket:close(RTMP),
+      {error, Error};
+    rtmp_closed ->
+      {error, closed};
+    [{object, _}, {object, Reply}] ->
+      case proplists:get_value(code, Reply) of
+        <<"NetConnection.Connect.Success">> ->
+          flush_onconnect_messages(RTMP),
+          {ok, RTMP};
+        OtherCode ->
+          rtmp_socket:close(RTMP),
+          {error, OtherCode}
+      end;
+    Else ->
+      rtmp_socket:close(RTMP),
+      {error, Else}      
+  end.
   
 flush_onconnect_messages(RTMP) ->
   receive
@@ -172,21 +180,15 @@ createStream(RTMP) ->
   round(StreamId).
 
 
+-spec play(URL::binary()|list()) -> {ok, RTMP::any(), StreamId::integer()}.
 play(URL) ->
   play(URL, [{timeout, 10000}]).
 
+-spec play(URL::binary()|list(), Options::[{any(),any()}]) -> {ok, RTMP::any(), StreamId::integer()}.
 play(URL, Options) when is_list(URL) orelse is_binary(URL) ->
-  Timeout = proplists:get_value(timeout, Options, 10000),
   case rtmp_socket:connect(URL, Options) of
-    {ok, RTMP} ->
-      receive
-        {rtmp, RTMP, connected} -> invoke_rtmp_play(RTMP, URL, Options);
-        {rtmp, RTMP, disconnect, _} -> {error, disconnect}
-      after
-        Timeout -> {error, timeout}
-      end;
-    Else ->
-      Else
+    {ok, RTMP} -> invoke_rtmp_play(RTMP, URL, Options);
+    Else -> Else
   end.
   
 app_path(URL) ->
@@ -202,15 +204,20 @@ app_path(URL) ->
   
 
 invoke_rtmp_play(RTMP, URL, Options) ->
-  rtmp_socket:setopts(RTMP, [{active, true}]),
-  connect(RTMP, Options),
-  {_App, Path} = app_path(URL),
-  ?D({"Connected to RTMP source", URL, _App, Path}),
-  Stream = rtmp_lib:createStream(RTMP),
-  ok = play(RTMP, Stream, Path),
-  ?D({"Playing", Path}),
-  
-  {ok, RTMP, Stream}.
+  rtmp_socket:setopts(RTMP, [{active, true},{url,URL}]),
+  case connect(RTMP, Options) of
+    {ok, RTMP} ->
+      {_App, Path} = app_path(URL),
+      ?D({"Connected to RTMP source", URL, _App, Path}),
+      Stream = rtmp_lib:createStream(RTMP),
+      case play(RTMP, Stream, Path) of
+        ok -> {ok, RTMP, Stream};
+        {error, _} = Error -> rtmp_socket:close(RTMP), Error
+      end;
+    {error, _} = Error ->
+      rtmp_socket:close(RTMP),
+      Error
+  end.
 
 
 play(RTMP, Stream, Path) when is_list(Path) ->
@@ -219,17 +226,38 @@ play(RTMP, Stream, Path) when is_list(Path) ->
 play(RTMP, Stream, Path) ->
   {ok, InvokeId} = call(RTMP, Stream, play, [Path]),
   ?D({play_success,Stream,Path,InvokeId}),
+  wait_for_play_reply(RTMP, Stream, InvokeId).
+
+
+wait_for_play_reply(RTMP, Stream, InvokeId) ->
   receive
-    {rtmp, RTMP, #rtmp_message{type = stream_begin, stream_id = Stream}} -> 
-      ok;
-    {rtmp, RTMP, #rtmp_message{type = invoke, body = #rtmp_funcall{command = <<"_error">>, id = InvokeId, args = Args}}} -> 
-      throw({rtmp_error, {play,Path}, tl(Args)});
+    {rtmp, RTMP, 
+      #rtmp_message{type = invoke, stream_id = Stream, body = #rtmp_funcall{command = <<"_error">>, args = [null|Args]}}} ->
+      {error, Args};
+    {rtmp, RTMP, 
+      #rtmp_message{type = invoke, stream_id = Stream, body = #rtmp_funcall{command = <<"onStatus">>, args = [null, {object, Info}]}}} ->
+      case proplists:get_value(code, Info) of
+        <<"NetStream.Play.Reset">> ->
+          wait_for_play_reply(RTMP, Stream, InvokeId);
+        <<"NetStream.Play.PublishNotify">> ->
+          wait_for_play_reply(RTMP, Stream, InvokeId);
+        <<"NetStream.Play.Start">> ->
+          ok;
+        <<"NetStream.Play.Failed">> ->
+          {error, Info};
+        <<"NetStream.Play.UnpublishNotify">> ->
+          {error, enoent};
+        <<"NetStream.Play.StreamNotFound">> ->
+          {error, enoent}
+      end;
+    {rtmp, RTMP, disconnect, _Stats} ->
+      {error, closed};
     {'DOWN', _, _, RTMP, _} ->
-      throw({rtmp_closed, {play,Path}})
+      {error, closed}
   after
-    30000 ->
-      ?D({timeout, Path, process_info(self(), messages)}),
-      erlang:error(timeout)
+    10000 ->
+      ?debugFmt("else ~p",[process_info(self(),messages)]),
+      {error, timeout}
   end.
 
 sync_call(RTMP, Stream, Command, Args) ->
@@ -292,10 +320,13 @@ publish(RTMP, Stream, Path, Type) ->
   },
   rtmp_socket:invoke(RTMP, AMF),
   receive
-    {rtmp, RTMP, #rtmp_message{type = stream_begin}} -> ok;
-    {rtmp, RTMP, disconnect, _} -> throw({rtmp_closed, {publish,Path}})
+    {rtmp, RTMP, #rtmp_message{type = stream_begin, stream_id = Stream}} -> ok;
+    {rtmp, RTMP, disconnect, _} -> throw({rtmp_closed, {publish,Path}});
+    {rtmp, RTMP, #rtmp_message{type = invoke, stream_id = Stream, body = #rtmp_funcall{command = <<"_error">>, args = Args}}} -> 
+      {rtmp_error, {publish,Path}, tl(Args)}
+    % Else -> ?debugFmt("else ~p, ~p",[Else, process_info(self(), messages)]), {rtmp_error, {publish,Path}, Else}
   after
-    30000 -> erlang:error(timeout)
+    10000 -> erlang:error(timeout)
   end.
 
 shared_object_connect(RTMP, Name) ->
@@ -443,7 +474,7 @@ play_failed(RTMP, StreamId) ->
 
   rtmp_socket:send(RTMP, #rtmp_message{type = stream_end, stream_id = StreamId, channel_id = 2, timestamp = 0}),
 
-  PlayStopArg = {object, [{level, <<"status">>}, {code, <<"NetStream.Play.Failed">>},{description,"file end"}]},
+  PlayStopArg = {object, [{level, <<"status">>}, {code, <<"NetStream.Play.Failed">>},{description,<<"file end">>}]},
   PlayStop = #rtmp_message{type = invoke, channel_id = channel_id(video, StreamId), timestamp = 0, stream_id = StreamId, 
                 body = #rtmp_funcall{command = onStatus, id = 0, stream_id = StreamId, args = [null, PlayStopArg]}},
   rtmp_socket:send(RTMP, PlayStop),

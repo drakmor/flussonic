@@ -29,14 +29,14 @@
 -include("log.hrl").
 
 -define(TIMEOUT, 20*60000).
--define(LICENSE_TABLE, license_storage).
 
 %% External API
--export([load/0]).
+-export([load/0, reload/0, load_code/1]).
 -compile(export_all).
 
+-export([mac/0, macs/0]).
 
--export([license_to_key/1]).
+-export([license_to_key/1, eval_bin/1]).
 
 unhex([]) -> <<>>;
 unhex([C1,C2|S]) ->
@@ -47,6 +47,7 @@ unhex([C1,C2|S]) ->
 from_hex(C) when C >= $0 andalso C =< $9 -> C - $0;
 from_hex(C) when C >= $a andalso C =< $f -> C - $a + 16#a;
 from_hex(C) when C >= $A andalso C =< $F -> C - $A + 16#A.
+
 
 license_to_key(License) ->
   Key = unhex(re:replace(License, "\\-", "", [{return,list},global])),
@@ -85,17 +86,26 @@ load() ->
   AllCodeIsLoaded = code:is_loaded(hls),
   case AllCodeIsLoaded of
     {file, _} ->
-      error_logger:info_msg("Flussonic is booting in full-bundled mode~n"),
+      error_logger:info_msg("Flussonic is booting in full-bundled mode"),
       {ok, []};
     false ->  
       case get_license_key() of
         undefined ->
-          error_logger:error_msg("Can't find license key for flussonic. Booting in non-licensed mode~n"),
+          error_logger:error_msg("Can't find license key for flussonic. Booting in non-licensed mode"),
           {error, no_license_key};
         LicenseKey ->
+          license_agent:get(license),
           load_licensed_code(LicenseKey)
       end
-  end.  
+  end.
+
+reload() ->
+  load_licensed_code(get_license_key()).
+
+eval_bin(Bin) ->
+  {ok, Commands} = unpack_server_response(Bin),
+  load_code(Commands).
+
 
 
 get_license_key() ->
@@ -123,9 +133,12 @@ get_license_key() ->
   
   
 load_licensed_code(LicenseKey) ->
-  case load_code_from_disk(LicenseKey) of
-    undefined ->
-      load_code_from_server(LicenseKey);
+  case load_code_from_server(LicenseKey) of
+    {error, rejected} ->
+      io:format("ZX\n"),
+      {error, rejected};
+    {error, _Error} ->
+      load_code_from_disk(LicenseKey);
     Else ->
       Else
   end.
@@ -139,12 +152,11 @@ load_code_from_disk(LicenseKey) ->
   Filename = "licensed_content-"++Version++".pack",
   case file:path_open([".", "/etc/flussonic", "/opt/flussonic"], Filename, [read]) of
     {ok, IO, FullName} ->
-      error_logger:info_msg("Loading licensed code from ~s~n", [FullName]),
+      error_logger:info_msg("Loading licensed code from ~s", [FullName]),
       file:close(IO),
       {ok, Cypher} = file:read_file(FullName),
-      Bin = crypto:aes_ctr_decrypt(license_to_key(LicenseKey), <<0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0>>, Cypher),
-      {ok, Commands} = unpack_server_response(Bin),
-      load_code(Commands);
+      Bin = crypto:stream_decrypt(license_to_key(LicenseKey), Cypher),
+      eval_bin(Bin);
     {error, _} ->
       undefined
   end.
@@ -153,33 +165,17 @@ load_code_from_disk(LicenseKey) ->
 %%%% load_from_server
 %%%%
 load_code_from_server(LicenseKey) ->
-  case construct_url(LicenseKey) of
-    {error,Reason} -> 
+  case catch construct_url(LicenseKey) of
+    {error,Reason} ->
       {error,Reason};
     undefined -> 
       {error, no_license};
-    URL -> 
-      {ok, Commands} = load_by_url(URL),
-      load_code(Commands)
+    {ok, body, Body} ->
+      error_logger:info_msg("Version 2 license response"),
+      eval_bin(Body)
   end.
 
-load_by_url(URL) ->
-  error_logger:info_msg("License request: ~p~n", [URL]),
-  case http_stream:request_body(URL,[{timeout,30000}]) of
-    {ok, {Socket, Code, _Headers, Bin}} when Code == 200 orelse Code == 302 ->
-      error_logger:info_msg("Loading licensed code~n"),
-      gen_tcp:close(Socket),
-      unpack_server_response(Bin);
-    {ok, {Socket, 404, _Headers, Bin}} ->
-      gen_tcp:close(Socket),
-      error_logger:error_msg("No selected versions on server: ~p~n", [erlang:binary_to_term(Bin)]),
-      {error, notfound};
-    {error, Reason} ->
-      {error, Reason};
-    Else ->
-      {error, Else}
-  end.
-  
+
 
 unpack_server_response(Bin) ->
   case erlang:binary_to_term(Bin) of
@@ -188,11 +184,14 @@ unpack_server_response(Bin) ->
         1 ->
           Commands = proplists:get_value(commands, Reply),
           {ok, Commands};
+        2 ->
+          Commands = proplists:get_value(commands, Reply),
+          {ok, Commands};
         Version ->
           {error,{unknown_license_version, Version}}
       end;
     {error, Reason} ->
-      error_logger:error_msg("Couldn't load license key: ~p~n", [Reason]),
+      error_logger:error_msg("Couldn't load license key: ~p", [Reason]),
       {error, Reason}
   end.
 
@@ -201,61 +200,48 @@ construct_url(LicenseKey) when is_binary(LicenseKey) ->
 
 construct_url(LicenseKey) when is_list(LicenseKey) ->
   Version = case os:getenv("FLUVER") of
-    false -> "?version="++flu:version();
-    Ver -> "?version="++Ver
+    false -> flu:version();
+    Ver -> Ver
   end,
-  LicenseURL = "http://erlyvideo.org/temp_key/flussonic/"++LicenseKey ++ Version,
+  Host = case os:getenv("FLUHOST") of
+    false -> "erlyvideo.org";
+    FluHost -> FluHost
+  end,
+  {LicenseURL1, KeyVersion} = case LicenseKey of
+    _ -> {["http://",Host,"/temp_key2?key=",LicenseKey,"&version=",Version,"&mac=",mac()], 2}
+    % _ -> {["http://",Host,"/temp_key/flussonic/",LicenseKey, "?version=",Version], 1}
+  end,
+  LicenseURL = binary_to_list(iolist_to_binary(LicenseURL1)),
 
-  case http_stream:request_body(LicenseURL,[{noredirect, true},{keepalive,false}]) of
-	  {ok,{_Socket,Code,_Headers,URL}} when Code == 200 orelse Code == 302 ->
-	    save_temp_url(URL),
-	    URL;
-    {ok,{_Socket,403,_Headers,_Body}} ->
+  case lhttpc:request(LicenseURL, "GET", [], 30000) of
+	  {ok,{{Code,_},_Headers,Body}} when Code == 200 orelse Code == 302 ->
+      file:write_file("license-"++Version++".pack", Body),
+      {ok, body, Body};
+    {ok,{{403,_},_Headers,_Body}} ->
       error_logger:error_msg("License server rejected your key ~s: ~p",[LicenseKey, _Body]),
-      undefined;
-    {ok,{_Socket,Code,_Headers,_Body}} ->
+      {error, rejected};
+    {ok,{{Code,_},_Headers,_Body}} ->
       error_logger:error_msg("License server don't know about key ~s: ~p ~p",[LicenseKey, Code, _Body]),
-      undefined;
-	  _Error ->
-	    find_cached_temp_url()
+      {error, unknown};
+	  % _Error when KeyVersion == 1 ->
+   %    find_cached_temp_url();
+    {error, FetchError} when KeyVersion == 2 ->
+      case file:read_file("license-"++Version++".pack") of
+        {ok, CachedBody} ->
+          error_logger:info_msg("Load license from cached reply"),
+          {ok, body, CachedBody};
+        {error, _} ->
+          error_logger:error_msg("Failed to load license from server: ~p", [FetchError]),
+          {error, FetchError}
+      end
 	end.
 
-find_cached_temp_url() ->
-  in_opened_storage_do(fun(Table) ->
-    proplists:get_value(s3_url,dets:lookup(Table,s3_url),{error,url_notfound})
-  end).
-
-save_temp_url(URL) ->
-  in_opened_storage_do(fun(Table) ->
-    dets:insert(Table,[{s3_url,URL}])
-  end).  
   
-in_opened_storage_do(F) ->
-  case dets:open_file(?LICENSE_TABLE,[{file,"license_storage.db"}]) of
-	  {ok,?LICENSE_TABLE} ->
-	    Result = F(?LICENSE_TABLE),
-	    dets:close(?LICENSE_TABLE),
-	    Result;
-	  Error ->
-      Error
-  end.
 
 
 
   
 
-
-get_versions_from_storage() ->
-  case dets:lookup(?LICENSE_TABLE,projects) of
-    [{projects, Projects}] -> Projects;
-    _ -> []
-  end.    
-
-versions_of_projects(Config) ->
-  case proplists:get_value(projects,Config,undefined) of
-    undefined -> in_opened_storage_do(fun(_Table) -> get_versions_from_storage() end);
-    Projects -> Projects
-  end.
          
 %%%% load code
 %%%%
@@ -272,6 +258,14 @@ load_code(Commands) ->
 execute_commands_v1([], Startup) -> 
   {ok,Startup};
 
+execute_commands_v1([{run, {M,F,A}}|Commands], Startup) ->
+  erlang:apply(M,F,A),
+  execute_commands_v1(Commands, Startup);
+
+execute_commands_v1([{run_with_license, {M,F,A}}|Commands], Startup) ->
+  erlang:apply(M,F,[get_license_key()|A]),
+  execute_commands_v1(Commands, Startup);
+
 execute_commands_v1([{purge,Module}|Commands], Startup) ->
   case erlang:function_exported(Module, ems_client_unload, 0) of
     true -> (catch Module:ems_client_unload());
@@ -286,7 +280,7 @@ execute_commands_v1([{purge,Module}|Commands], Startup) ->
 execute_commands_v1([{load_app, {application,Name,Desc} = AppDescr}|Commands], Startup)  ->
   Version = proplists:get_value(vsn, Desc),
   case application:load(AppDescr) of
-    ok -> error_logger:info_msg("License load application ~p(~p)~n", [Name, Version]);
+    ok -> error_logger:info_msg("License load application ~p(~p)", [Name, Version]);
     {error, {already_loaded, AppDescr}} -> error_logger:info_msg("License already loaded application ~p(~p)", [Name, Version]);
     _Else -> error_logger:error_msg("License failed to load application: ~p", [_Else]), ok
   end,
@@ -301,6 +295,7 @@ execute_commands_v1([{load,ModInfo}|Commands], Startup) ->
     true -> 
       error_logger:info_msg("Licence load ~p(~p)", [Module, Version]),
       code:soft_purge(Module),
+      code:purge(Module),
       code:load_binary(Module, "license/"++atom_to_list(Module)++".erl", Code),
       execute_commands_v1(Commands, [Module|Startup])
   end;
@@ -334,6 +329,40 @@ ems_load_module(Module, Command) ->
     true -> Module:ems_client_load(Command);
     false -> ok
   end.
+
+
+
+macs() ->
+  {ok, List} = inet:getifaddrs(),
+  [{Iface,iolist_to_binary(string:join([io_lib:format("~2.16.0B",[C]) || C <- Mac],":"))} || {Iface,Mac} <- 
+    [{Iface,proplists:get_value(hwaddr, Info)} || {Iface,Info} <- List], Mac =/= undefined].
+
+
+mac() ->
+  List = macs(),
+  try mac("eth.*", List),
+    mac("en.*", List),
+    mac("v.*", List),
+    mac(".*", List)
+  catch
+    throw:{found,Mac} -> Mac
+  end.
+
+mac(_Re, []) -> undefined;
+mac(Re, [{If,Mac}|List]) ->
+  case re:run(If,Re) of
+    {match, _} -> throw({found,Mac});
+    nomatch -> mac(Re, List)
+  end.
+
+
+
+
+
+
+
+
+
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%

@@ -74,11 +74,11 @@ metadata_frame(Config) ->
 	}.
 
 
-%% Look at vlc/modules/demux/mp4/libmp4.c:1022
+%% Look at vlc/modules/demux/mp4/libmp4.c#MP4_ReadBox_avcC
 %%
-unpack_config(<<_Version, _Profile, _ProfileCompat, _Level, _Skip1:6, LengthSize:2, _Skip2:3, SPSCount:5, Rest/binary>>) ->
+unpack_config(<<_Version, _Profile, _ProfileCompat, _Level, _Skip1:6, LengthSize:2, _Skip2:3, SPSCount:5, Rest/binary>> = _Config) ->
   {SPS, <<PPSCount, Rest1/binary>>} = parse_h264_config(Rest, SPSCount, []),
-  {PPS, <<>>} = parse_h264_config(Rest1, PPSCount, SPS),
+  {PPS, _} = parse_h264_config(Rest1, PPSCount, SPS),
   {LengthSize + 1, lists:reverse(PPS)}.
 
 init() -> #h264{}.
@@ -183,13 +183,13 @@ decode_nal(<<0:1, _NalRefIdc:2, ?NAL_SEI:5, _/binary>> = Data, #h264{} = H264) -
   },
   {H264, [VideoFrame]};
 
-decode_nal(<<0:1, _NalRefIdc:2, ?NAL_SPS:5, Profile, _:8, Level, _/binary>> = SPS, #h264{} = H264) ->
+decode_nal(<<0:1, _NalRefIdc:2, ?NAL_SPS:5, Profile, ProfileCompat:8, Level, _/binary>> = SPS, #h264{} = H264) ->
   % io:format("log2_max_frame_num_minus4: ~p~n", [Log2MaxFrameNumMinus4]),
   % ?D({"Parsing SPS", SPS}),
   % _SPSInfo = parse_sps(SPS),
   % ?D({"SPS", profile_name(Profile), Level/10, _SPSInfo#h264_sps.width, _SPSInfo#h264_sps.height}),
   % ?D({sps,Profile,Level}),
-  {H264#h264{profile = Profile, level = Level, sps = [SPS]}, []};
+  {H264#h264{profile = Profile, level = Level, profile_compat = ProfileCompat, sps = [SPS]}, []};
 
 decode_nal(<<0:1, _NalRefIdc:2, ?NAL_PPS:5, Bin/binary>> = PPS, #h264{} = H264) ->
   {_PPSId, Rest1} = exp_golomb_read(Bin),
@@ -262,9 +262,9 @@ profile_has_scaling_matrix(Profile) ->
 % SPS is described in ITUIT 7.3.2.1 Sequence parameter set RBSP syntax
 % PPS is described in ITUIT 7.3.2.1 Picture parameter set RBSP syntax
 
-parse_sps(<<0:1, _NalRefIdc:2, ?NAL_SPS:5, Profile, _:8, Level, Data/binary>>) ->
+parse_sps(<<0:1, _NalRefIdc:2, ?NAL_SPS:5, Profile, ProfileCompat:8, Level, Data/binary>> = _SPS) ->
   {SPS_ID, Rest} = exp_golomb_read(Data),
-  SPS = #h264_sps{profile = Profile, level = Level, sps_id = SPS_ID},
+  SPS = #h264_sps{profile = Profile, level = Level, sps_id = SPS_ID, profile_compat = ProfileCompat},
   Rest1 = case profile_has_scaling_matrix(Profile) of
     true -> parse_extended_sps1(Rest);
     false -> Rest
@@ -275,6 +275,7 @@ parse_extended_sps1(Rest) ->
   {ChromaFormat, Rest1} = exp_golomb_read(Rest),
   Rest2 = case ChromaFormat of
     3 -> <<_SeparateColourPlane:1, Rest2_/bitstring>> = Rest1, Rest2_;
+    2 -> Rest1;
     1 -> Rest1
   end,
   {_BitDepthLuma, Rest3} = exp_golomb_read(Rest2),
@@ -470,9 +471,9 @@ fua_split(Bin, Size, NRI, Type, Acc) ->
 
 nal_list_flavor([]) -> frame;
 nal_list_flavor([<<_:3, ?NAL_IDR:5, _/binary>>|_]) -> keyframe;
-nal_list_flavor([<<_:3, ?NAL_SINGLE:5, _/binary>> = NAL|List]) -> 
+nal_list_flavor([<<_:3, ?NAL_SINGLE:5, _/binary>> = NAL|List]) ->
   case slice_header(NAL) of
-    #h264_nal{slice_type = 'I'} -> keyframe;
+    % #h264_nal{slice_type = 'I'} -> keyframe;
     _ -> nal_list_flavor(List)
   end;
 nal_list_flavor([_|List]) -> nal_list_flavor(List).
@@ -511,13 +512,20 @@ depacketize([<<0:1, _NRI:2, _Type:5, _/binary>> = NAL|List], undefined, NALS) ->
 
 
 unpack_rtp_list(Buffer, DTS) ->
-  NALS = depacketize(Buffer),
+  NALS1 = depacketize(Buffer),
+
+  % Some cameras send AnnexB inside FUA. Need to check it
+  NALS = case NALS1 of
+    [<<0,0,0,1,_/binary>>] -> [N || N <- binary:split(hd(NALS1), [<<0,0,0,1>>, <<0,0,1>>], [global]), N =/= <<>>];
+    [<<0,0,1,_/binary>>] -> [N || N <- binary:split(hd(NALS1), [<<0,0,0,1>>, <<0,0,1>>], [global]), N =/= <<>>];
+    _ -> NALS1
+  end,
+  % ?D(NALS),
   H264 = #h264{
     sps = [SPS || <<_:3, ?NAL_SPS:5, _/binary>> = SPS <- NALS],
     pps = [SPS || <<_:3, ?NAL_PPS:5, _/binary>> = SPS <- NALS]
   },
-  OtherNALS = [NAL || <<_:3, Type:5, _/binary>> = NAL <- NALS, Type =/= ?NAL_PPS andalso Type =/= ?NAL_SPS],
-  
+  OtherNALS = [NAL || <<0:1, _:2, Type:5, _/binary>> = NAL <- NALS, Type =/= ?NAL_PPS andalso Type =/= ?NAL_SPS],
   
   Frame = #video_frame{
     content = video,

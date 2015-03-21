@@ -24,7 +24,6 @@
 -module(mp4_reader).
 -author('Max Lapshin <max@maxidoors.ru>').
 
--behaviour(gen_format).
 -include("../include/video_frame.hrl").
 -include("../include/mp4.hrl").
 -include("../include/aac.hrl").
@@ -35,8 +34,12 @@
 -export([init/2, media_info/1, read_frame/2, properties/1, seek/3, can_open_file/1, write_frame/2]).
 -export([tracks_for/2]).
 -export([keyframes/1, keyframes/2]).
+-export([mp4_frame_to_video_frame/2]).
+-export([read_gop/2, read_gop/3]).
 
 -define(FRAMESIZE, 8).
+
+
 
 can_open_file(Name) when is_binary(Name) ->
   can_open_file(binary_to_list(Name));
@@ -48,10 +51,15 @@ write_frame(_Device, _Frame) ->
   erlang:error(unsupported).
 
 
+read_gop(Media, Id) -> read_gop(Media, Id, undefined).
+
+read_gop(#mp4_media{handler = Handler} = Media, Id, Tracks) ->
+  Handler:read_gop(Media, Id, Tracks).
 
 
-init(Reader, Options) -> 
-  {ok, MP4Media} = mp4:open(Reader, Options),
+init(Reader, Options) ->
+  Handler = proplists:get_value(handler, Options, mp4),
+  {ok, MP4Media} = Handler:open(Reader, Options),
   
   %Tracks = tuple_to_list(MP4Media#mp4_media.tracks) ++ SrtFrames,
   % Tracks = tuple_to_list(MP4Media#mp4_media.tracks),
@@ -60,7 +68,7 @@ init(Reader, Options) ->
   % Languages = [Lang || #mp4_track{language = Lang, content = Content} <- Tracks, Content == audio],
   % ?D({"MP4", Options, [Track#mp4_track{frames = frames} || Track <- Tracks]}),
 
-  {ok, MP4Media#mp4_media{options = Options}}.
+  {ok, MP4Media#mp4_media{handler = Handler, options = Options}}.
 
 
 
@@ -109,9 +117,13 @@ media_info(#mp4_media{additional = Additional, duration = Duration, tracks = Tra
         };
       audio when Track#mp4_track.codec == aac andalso Track#mp4_track.decoder_config =/= undefined -> 
         AudioConfig = #aac_config{channel_count = Channels, sample_rate = SampleRate} = aac:decode_config(Track#mp4_track.decoder_config),
-        #audio_params{channels = Channels, sample_rate = SampleRate, config = AudioConfig};
+        #audio_params{channels = Channels, sample_rate = SampleRate, config = AudioConfig, samples = 1024};
       audio -> #audio_params{};
       _ -> undefined
+    end,
+    Timescale = case Content of 
+      audio when is_number(Params#audio_params.sample_rate) -> Params#audio_params.sample_rate / 1000;
+      _ -> 90.0
     end,
     #stream_info{
       content   = Track#mp4_track.content,
@@ -120,6 +132,7 @@ media_info(#mp4_media{additional = Additional, duration = Duration, tracks = Tra
       config    = Track#mp4_track.decoder_config,
       bitrate   = Track#mp4_track.bitrate,
       language  = Track#mp4_track.language,
+      timescale = Timescale,
       params    = Params
     }
   end, tuple_to_list(Tracks)),
@@ -229,24 +242,31 @@ read_frame(#mp4_media{} = Media, {config, Content, TrackId, DTS, Pos}) ->
 read_frame(_, eof) ->
   eof;
 
-read_frame(#mp4_media{} = Media, Id) ->
-  case mp4:read_frame(Media, Id) of
+read_frame(#mp4_media{handler = Handler} = Media, Id) ->
+  case Handler:read_frame(Media, Id) of
     eof ->
       eof;
     #mp4_frame{content = text, next_id = Next, body = Data, track_id = TrackId} = Frame ->
 		  VideoFrame = video_frame(text, Frame, Data),
 		  VideoFrame#video_frame{next_id = Next, track_id = TrackId};
-    #mp4_frame{offset = Offset, size = Size, content = Content, next_id = Next, track_id = TrackId} = Frame ->
+    #mp4_frame{} = Frame ->
       % ?D({"read frame", Id, Offset, Size,Content}),
-    	case read_data(Media, Offset, Size) of
-    		{ok, Data, _} ->
-    		  VideoFrame = video_frame(Content, Frame, Data),
-    		  VideoFrame#video_frame{next_id = Next, track_id = TrackId};
-        eof -> eof;
-        {error, Reason} -> {error, Reason}
-      end
+      mp4_frame_to_video_frame(Media, Frame)
   end.
-  
+
+mp4_frame_to_video_frame(Media, #mp4_frame{offset = Offset, size = Size, content = Content, next_id = Next, track_id = TrackId} = Frame) ->
+  case read_data(Media, Offset, Size) of
+    {ok, Data, _} ->
+      % if Content == audio -> io:format("~4.. s ~5.. B:  ~B@~B~n", [Frame#mp4_frame.codec, round(Frame#mp4_frame.dts), Offset, Size]);
+      %   true -> ok end,
+      VideoFrame = video_frame(Content, Frame, Data),
+      VideoFrame#video_frame{next_id = Next, track_id = TrackId};
+    eof -> eof;
+    {error, Reason} -> {error, Reason}
+  end.
+
+
+
 
 read_data(#mp4_media{reader = {M, Dev}} = Media, Offset, Size) ->
   case M:pread(Dev, Offset, Size) of
@@ -303,11 +323,11 @@ seek(#mp4_media{} = Media, Timestamp, Options) when Timestamp =< 0 orelse Timest
 seek(#mp4_media{duration = Duration}, Timestamp, _Options) when Timestamp > Duration ->
   undefined;
 
-seek(#mp4_media{} = Media, Timestamp, Options) ->
+seek(#mp4_media{handler = Handler} = Media, Timestamp, Options) ->
   % TODO: insert here ability to seek in options
   Tracks = tracks_for(Media, Options),
   % ?D({mp4_seek, Timestamp, mp4:seek(Media, Video, Timestamp, proplists:get_value(seek_mode, Options, keyframe))}),
-  case mp4:seek(Media, Tracks, Timestamp, proplists:get_value(seek_mode, Options, keyframe)) of
+  case Handler:seek(Media, Tracks, Timestamp, proplists:get_value(seek_mode, Options, keyframe)) of
     undefined -> undefined;
     {Id, DTS} ->
       first(Media, Options, Id, DTS)
@@ -316,9 +336,11 @@ seek(#mp4_media{} = Media, Timestamp, Options) ->
 keyframes(#mp4_media{} = Media) ->
   keyframes(Media, []).
 
-keyframes(#mp4_media{} = Media, Options) ->
+keyframes(#mp4_media{handler = Handler} = Media, Options) ->
   Tracks = tracks_for(Media, Options),
-  Keyframes = mp4:keyframes(Media, Tracks),
-  [{DTS, #frame_id{id = Id, tracks = Tracks}} || {DTS, Id} <- Keyframes].
+  case Handler:keyframes(Media, Tracks) of
+    {error, _} = Error -> Error;
+    Keyframes -> [{DTS, #frame_id{id = Id, tracks = Tracks}} || {DTS, Id} <- Keyframes]
+  end.
 
 

@@ -42,10 +42,11 @@
   decoder,
   socket,
   options,
+  counters,
+  url,
   byte_counter = 0,
   media_info,
   delay_for_config = true,
-  sent_media_info = false,
   delayed_frames = [],
   current_time
 }).
@@ -86,7 +87,9 @@ init([Options]) ->
       erlang:monitor(process, Cons),
       Cons
   end,
-  {ok, #reader{consumer = Consumer, options = Options, decoder = mpegts_decoder:init()}}.
+  URL = proplists:get_value(url, Options),
+  put(name, {mpegts_reader,URL}),
+  {ok, #reader{consumer = Consumer, url = URL, options = Options, counters = dict:new(), decoder = mpegts_decoder:init()}}.
 
 
 
@@ -98,17 +101,22 @@ handle_call({set_socket, Socket}, _From, #reader{} = Decoder) ->
 handle_call(media_info, _From, #reader{media_info = MI} = Decoder) ->
   {reply, MI, Decoder};
 
-handle_call(connect, _From, #reader{options = Options} = Decoder) ->
-  URL = proplists:get_value(url, Options),
+handle_call(connect, _From, #reader{options = Options, url = URL} = Decoder) ->
   Timeout = proplists:get_value(timeout, Options, 2000),
-  {Schema, _, _Host, _Port, _Path, _Query} = http_uri2:parse(URL),
-  case Schema of
-    udp -> 
+  {Schema, AuthInfo, _Host, _Port, _Path, _Query} = http_uri2:parse(URL),
+  if Schema == udp orelse Schema == udp2 ->
       {ok, Socket} = connect_udp(URL),
       % ?DBG("MPEG-TS reader connected to \"~s\"", [URL]),
   	  {reply, ok, Decoder#reader{socket = Socket}};
-    _ ->
-      case  http_stream:request(URL, [{timeout,Timeout}]) of 
+    true ->
+      Auth = case AuthInfo of
+        "" -> [];
+        _ ->
+          [User,Passwd] = string:tokens(AuthInfo, ":"),
+          [{basic_auth, {User, Passwd}}]
+      end,
+
+      case http_stream:request(URL, [{timeout,Timeout}] ++ Auth) of 
       	{ok,{Socket,_Code,_Header}} ->
       	  ok = inet:setopts(Socket, [{packet,raw},{active,once}]),
       	  % ?D({connected, URL, Socket}),
@@ -125,36 +133,47 @@ handle_info({'DOWN', _Ref, process, Consumer, _Reason}, #reader{consumer = Consu
   {stop, normal, State};
   
 handle_info({tcp, Socket, Bin}, #reader{} = Reader) ->
-  handle_info({input_data, Socket, Bin}, Reader);
-
-handle_info({udp, Socket, _IP, _InPortNo, Bin}, #reader{} = Reader) ->
-  handle_info({input_data, Socket, Bin}, Reader);
-
-handle_info({input_data, Socket, Bin}, #reader{consumer = Consumer, decoder = Decoder, sent_media_info = Sent} = Reader) ->
   inet:setopts(Socket, [{active,once}]),
+  handle_info({input_data, Socket, Bin}, Reader);
+
+handle_info({udp, Socket, _IP, _InPortNo, Bin}, #reader{counters = Counters, url = _URL} = Reader) ->
+  Data = iolist_to_binary([Bin|fetch_udp(Socket)]),
+  % Counters2 = validate_mpegts(Data, Counters, URL),
+  Counters2 = Counters,
+  inet:setopts(Socket, [{active,once}]),
+  handle_info({input_data, Socket, Data}, Reader#reader{counters = Counters2});
+
+handle_info({mpegts_udp, Socket, Data}, #reader{counters = Counters, url = _URL} = Reader) ->
+  % Counters2 = validate_mpegts(Data, Counters, URL),
+  Counters2 = Counters,
+  mpegts_udp:active_once(Socket),
+  handle_info({input_data, Socket, Data}, Reader#reader{counters = Counters2});  
+
+handle_info({input_data, _Socket, Bin}, #reader{consumer = Consumer, decoder = Decoder, media_info = MI1} = Reader) ->
   try mpegts_decoder:decode(Bin, Decoder) of
     {ok, Decoder2, Frames} ->
-      % send_media_info_if_needed(Decoder_, Frames),
-      % if Delay1 andalso not Delay2 ->
-      %   Consumer ! MediaInfo;
-      % true -> ok end,
-      Sent1 = case Sent of
-        true -> true;
-        false -> case mpegts_decoder:media_info(Decoder2) of
-          #media_info{} = MI -> Consumer ! MI, true;
-          undefined -> false
-        end
+      % ?debugFmt("frames: ~p", [[{Codec,Flavor} || #video_frame{codec = Codec, flavor = Flavor} <- Frames]]),
+      MI2 = video_frame:define_media_info(MI1, Frames),
+      % ?debugFmt("mi: ~p", [MI2]),
+      MI3 = case MI2 of
+        #media_info{streams = []} -> undefined;
+        #media_info{} when MI2 =/= MI1 -> Consumer ! MI2;
+        _ -> MI2
+        % undefined -> MI2;
+        % #media_info{} -> Consumer ! MI2
       end,
-      case Sent1 of
-        true -> [Consumer ! Frame || Frame <- Frames];
-        false -> ok
+      case MI3 of
+        undefined -> ok;
+        _ -> [gen_server:call(Consumer, Frame) || Frame <- Frames]
       end,
-      {noreply, Reader#reader{decoder = Decoder2, sent_media_info = Sent1}}
+      {noreply, Reader#reader{decoder = Decoder2, media_info = MI3}}
   catch
     error:{desync_adts,_Bin} ->
       {noreply, Reader};
+    error:invalid_payload ->
+      {noreply, Reader};
     Class:Error ->
-      ?debugFmt("~p:~p~n~240p~n",[Class,Error, erlang:get_stacktrace()]),
+      lager:error("~p:~p~n~p~n", [Class, Error, erlang:get_stacktrace()]),
       % ?D({udp_mpegts,Class,Error, erlang:get_stacktrace()}),
       {stop, {Class, Error}, Reader}
   end;
@@ -162,8 +181,40 @@ handle_info({input_data, Socket, Bin}, #reader{consumer = Consumer, decoder = De
 handle_info({tcp_closed, _Socket}, #reader{} = Reader) ->
   {stop, normal, Reader};
 
+handle_info({Ref, _Reply}, #reader{} = Reader) when is_reference(Ref) ->
+  {noreply, Reader};
+
 handle_info(Else, #reader{} = Reader) ->
   {stop, {unknown_message, Else}, Reader}.
+
+
+fetch_udp(Socket) ->
+  case gen_udp:recv(Socket, 2*1024*1024, 0) of
+    {ok, {_, _, Bin}} -> [Bin|fetch_udp(Socket)];
+    {error, timeout} -> [];
+    {error, Error} -> error({udp,Error})
+  end.
+
+
+% validate_mpegts(Data, Counters, URL) ->
+%   Packets = [{Pid,Counter} || <<16#47, _:3, Pid:13, _:4, Counter:4, _:184/binary>> <= Data],
+%   Counters2 = lists:foldl(fun({Pid,Counter}, Counters1) ->
+%     case dict:find(Pid, Counters1) of
+%       {ok, Value} when (Value + 1) rem 16 == Counter -> ok;
+%       {ok, Value} when (Value + 1) rem 16 =/= Counter ->
+%         {Mega,Sec,_} = os:timestamp(),
+%         CurrentMinute = (Mega*1000000+Sec) div 60,
+%         case get(error_happened_at) of
+%           CurrentMinute -> ok;
+%           _ -> ?ERR("Pid ~p desync ~B -> ~B (~s)", [Pid,Value,Counter,URL])
+%         end,
+%         put(error_happened_at, CurrentMinute)
+%         ;
+%       error -> ok
+%     end,
+%     dict:store(Pid,Counter,Counters1)
+%   end, Counters, Packets),
+%   Counters2.
 
 
 % send_media_info_if_needed(#reader{consumer = Consumer, media_info = #media_info{}} = Decoder, Frames) when length(Frames) > 0 ->
@@ -189,18 +240,38 @@ code_change(_OldVsn, State, _Extra) ->
 
     
 connect_udp(URL) ->
-  {_, _, Host, Port, _Path, _Query} = http_uri2:parse(URL),
+  {Proto, _, Host, Port, _Path, _Query} = http_uri2:parse(URL),
   {ok, Addr} = inet_parse:address(Host),
-  Common = [binary,{active,once},{recbuf,65536},inet,{ip,Addr}],
-  case is_multicast(Addr) of
+  % Yes. Here is active,true because UDP can loose data
+  Common = [binary,{active,once},{recbuf,2*1024*1024},inet,{ip,Addr}],
+  Options = case is_multicast(Addr) of
     true ->
       Multicast = [{reuseaddr,true},{multicast_ttl,4},{multicast_loop,true}],
-      {ok, Socket} = gen_udp:open(Port, Common ++ Multicast),
-      inet:setopts(Socket,[{add_membership,{Addr,{0,0,0,0}}}]),
-      {ok, Socket};
+      Common ++ Multicast;
     false ->
-      {ok, Socket} = gen_udp:open(Port, Common),
-      {ok, Socket}
+      Common
+  end,
+
+  case Proto of
+    udp ->
+      {ok, Socket} = gen_udp:open(Port, Options),
+      case is_multicast(Addr) of
+        true -> inet:setopts(Socket,[{add_membership,{Addr,{0,0,0,0}}}]);
+        false -> ok
+      end,
+      inet:setopts(Socket, [{active,once}]),
+      process_flag(priority, high),
+      {ok, Socket};
+    udp2 ->
+      case mpegts_udp:open(Port, Options) of
+        {ok, Socket} ->
+          process_flag(priority, high),
+          mpegts_udp:active_once(Socket),
+          {ok, Socket};
+        {error, _E} = Error ->
+          ?D(Error),
+          Error
+      end
   end.
 
 

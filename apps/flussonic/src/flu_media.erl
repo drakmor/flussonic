@@ -1,6 +1,22 @@
 %%% @author     Max Lapshin <max@maxidoors.ru> [http://erlyvideo.org]
 %%% @copyright  2010-2012 Max Lapshin
-%%% @doc        common media
+%%% @doc        
+% This module must help different protocols to make lookups in flussonic config and launch streams and files.
+% There are three basic types of media in flussonic: 
+%
+% 1) static stream that is already launched. It may be accessed via HTTP without any prefix
+% 2) live stream that is published by users ondemand
+% 3) files
+%
+% Files and streams live in different tracking tables, but they live in the same HTTP url namespace
+%
+% Each media has two different names: 
+% 1) its outer name, which is visible via HTTP
+% 2) its inner URL that points to real media
+%
+% Live medias has null URL, because they dont know when and how to reconnect.
+% 
+%
 %%% @reference  See <a href="http://erlyvideo.org" target="_top">http://erlyvideo.org</a> for more information
 %%% @end
 %%%
@@ -44,8 +60,8 @@ find_or_open(Path, Headers) ->
 find_or_open0(Path, Headers) ->
   case lookup(Path) of
     {ok, {Type, Name, Opts}} ->
-      case proplists:get_value(sessions, Opts) of
-        undefined ->
+      case proplists:get_value(sessions, Opts, true) of
+        false ->
           {ok, Reply} = autostart(Type, Name, Opts),
           {ok, Reply};
         AuthUrl ->
@@ -67,7 +83,7 @@ find_or_open0(Path, Headers) ->
 
 
 find(Path) ->
-  case gen_tracker:find(flu_streams, Path) of
+  case flu_stream:find(Path) of
     {ok, Pid} -> 
       {stream, Pid};
     undefined ->
@@ -79,11 +95,15 @@ find(Path) ->
       end
   end.
 
+
+
+-spec find_or_open(Path::binary()|list()) ->
+  {ok, {file, Pid::pid()}} | {ok, {stream, Pid::pid()}} | {error, Error::term()}.
 find_or_open(Path) when is_list(Path) ->
   find_or_open(list_to_binary(Path));
 
 find_or_open(Path) ->
-  case gen_tracker:find(flu_streams, Path) of
+  case flu_stream:find(Path) of
     undefined ->
       case lookup(Path) of
         {ok, {Type, Name, Opts}} ->
@@ -95,7 +115,7 @@ find_or_open(Path) ->
       {ok,{stream,Path}}
   end.
   
-autostart(file, File, Opts) -> open_file(proplists:get_value(root,Opts), File, []);
+autostart(file, File, Opts) -> open_file(File, Opts);
 autostart(Type, Stream, Opts) when Type == stream orelse Type == live -> 
   {ok, Media} = flu_stream:autostart(Stream, Opts),
   {ok, {stream, Media}}.
@@ -119,7 +139,7 @@ lookup(Path) ->
 lookup(Path, [{live, Prefix, Options}|Config]) ->
   PrefixLen = size(Prefix),
   case Path of
-    <<Prefix:PrefixLen/binary, "/", Stream/binary>> -> {ok, {live, Stream, [{prefix,Prefix}|Options]}};
+    <<Prefix:PrefixLen/binary, "/", _Stream/binary>> -> {ok, {live, Path, [{prefix,Prefix}|Options]}};
     _ -> lookup(Path, Config)
   end;
 
@@ -127,7 +147,7 @@ lookup(Path, [{file, Prefix, Root, Opts}|Config]) ->
   PrefixLen = size(Prefix),
   case Path of
     <<Prefix:PrefixLen/binary, "/", File/binary>> -> 
-      {ok, {file, File, [{root, Root}|Opts]}};
+      {ok, {file, Path, [{path,filename:join(Root, File)}|Opts]}};
     _ -> lookup(Path, Config)
   end;
   
@@ -141,8 +161,9 @@ lookup(_Path, []) ->
   {error, enoent}.
 
 
-open_file(Root, Path, _Env) ->
-  case gen_tracker:find_or_open(flu_files, Path, fun() -> flussonic_sup:start_flu_file(Path, [{root,Root}]) end) of
+open_file(Name, Opts) ->
+  {path,Path} = lists:keyfind(path,1,Opts),
+  case flu_file:autostart(Path, Name) of
   	{ok, File} ->
   	  {ok, {file,File}};
   	Error ->

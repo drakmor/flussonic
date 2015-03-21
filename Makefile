@@ -15,9 +15,13 @@ install:
 	cp priv/sample/flussonic.conf $(DESTDIR)/etc/flussonic/flussonic.conf
 
 
+ct:
+	ct_run -pa `pwd`/apps/*/ebin -pa `pwd`/deps/*/ebin -dir apps/*/test -logdir logs/
 
-test:
+eunit:
 	./rebar eunit skip_deps=true
+
+test: ct eunit
 
 app: deps/cowboy deps/lager/ebin/lager_transform.beam
 	./rebar compile skip_deps=true
@@ -30,6 +34,7 @@ deps/lager/ebin/lager_transform.beam:
 
 clean:
 	./rebar clean
+	rm -f apps/*/test/*.beam
 	rm -f erl_crash.dump
 
 compile_public:
@@ -37,7 +42,7 @@ compile_public:
 	vagrant up compile_public
 
 run:
-	ERL_LIBS=apps:deps erl +K true +A 16 +a 2048 -name $(NODENAME)@127.0.0.1 -pa apps/*/ebin -pa deps/*/ebin -boot start_sasl -s flussonic -sasl errlog_type error
+	ERL_LIBS=apps:deps erl +K true +A 16 +a 2048 -name flussonic@127.0.0.1 -pa apps/*/ebin -pa deps/*/ebin -boot start_sasl -s flussonic -sasl errlog_type error
 
 shell:
 	erl -name debug@127.0.0.1 -remsh flussonic@127.0.0.1
@@ -56,11 +61,11 @@ vagrant:
 	
 
 start:
-	mkdir -p log/pipe
-	run_erl -daemon log/pipe/ log/ "exec make run"
+	mkdir -p log/pipe log/console
+	export RUN_ERL_LOG_GENERATIONS=5
+	export RUN_ERL_LOG_MAXSIZE=100000
+	run_erl -daemon log/pipe/ log/console/ "exec make run"
 	while [ ! -e log/flussonic.pid ] ; do sleep 1; echo "."; done
-	# echo `ps axuww |grep beam.smp| grep "sname flussonic" | head -1 | awk '{print $$2}'` > log/flussonic.pid
-	cat log/flussonic.pid
 
 attach:
 	to_erl log/pipe/
@@ -87,6 +92,7 @@ tgz:
 	find flussonic-$(VERSION) -name *.app.src -exec perl -pi -e s,git,'"v1.0"',g {} \;
 	find flussonic-$(VERSION) -name .gitignore -delete
 	cat rebar.config |grep -v meck > flussonic-$(VERSION)/rebar.config
+	rm -rf flussonic-$(VERSION)/test
 	rm -rf flussonic-$(VERSION)/deps/meck
 	rm -rf flussonic-$(VERSION)/deps/cowboy/test
 	rm -rf flussonic-$(VERSION)/deps/cowboy/examples
@@ -105,10 +111,11 @@ package:
 	git archive master | (cd tmproot/opt/flussonic; tar x)
 	mkdir -p tmproot/opt/flussonic/deps
 	rm -rf tmproot/opt/flussonic/priv/mbr*.mp4
+	rm -rf tmproot/opt/flussonic/test
 	[ -d deps ] && for d in deps/* ; do git clone $$d tmproot/opt/flussonic/deps/`basename $$d`; done || true
 	(cd tmproot/opt/flussonic/ && ./rebar get-deps && ./rebar compile)
 	mkdir -p tmproot/opt/flussonic/apps/flussonic/priv/
-	cp -f priv/mmap-squeeze64.so tmproot/opt/flussonic/apps/flussonic/priv/mmap.so
+	mkdir -p tmproot/opt/flussonic/apps/mpegts/priv/
 	rm -rf tmproot/opt/flussonic/deps/proper*
 	rm -rf tmproot/opt/flussonic/apps/ffmpeg
 	rm -rf tmproot/opt/flussonic/apps/mpegts/contrib/build_table.rb tmproot/opt/flussonic/apps/rtsp/priv/* tmproot/opt/flussonic/deps/*/test
@@ -120,11 +127,28 @@ package:
 	cp priv/flussonic tmproot/etc/init.d/
 	mkdir -p tmproot/etc/flussonic
 	cp priv/sample/*.conf tmproot/etc/flussonic/
+
+	cp -f priv/mpegts_udp-squeeze64.so tmproot/opt/flussonic/apps/mpegts/priv/mpegts_udp.so
 	cd tmproot && \
 	fpm -s dir -t deb -n flussonic -v $(VERSION) --category net \
 	--post-install ../debian/postinst --pre-uninstall ../debian/prerm --post-uninstall ../debian/postrm \
 	--config-files /etc/flussonic/flussonic.conf --config-files /etc/flussonic/streams.conf --config-files '/etc/flussonic/*.conf' \
 	-d 'esl-erlang (>= 15) | esl-erlang-nox (>= 15) | erlang-nox (>= 1:15)' -m "Max Lapshin <max@maxidoors.ru>" -a amd64 etc/init.d/flussonic etc/flussonic opt 
+
+	cp -f priv/mpegts_udp-squeeze32.so tmproot/opt/flussonic/apps/mpegts/priv/mpegts_udp.so
+	cd tmproot && \
+	fpm -s dir -t deb -n flussonic -v $(VERSION) --category net \
+	--post-install ../debian/postinst --pre-uninstall ../debian/prerm --post-uninstall ../debian/postrm \
+	--config-files /etc/flussonic/flussonic.conf --config-files /etc/flussonic/streams.conf --config-files '/etc/flussonic/*.conf' \
+	-d 'esl-erlang (>= 15) | esl-erlang-nox (>= 15) | erlang-nox (>= 1:15)' -m "Max Lapshin <max@maxidoors.ru>" -a i386 etc/init.d/flussonic etc/flussonic opt 
+
+	#cp -f priv/mpegts_udp-armel.so tmproot/opt/flussonic/apps/mpegts/priv/mpegts_udp.so
+	#cd tmproot && \
+	#fpm -s dir -t deb -n flussonic -v $(VERSION) --category net \
+	#--post-install ../debian/postinst --pre-uninstall ../debian/prerm --post-uninstall ../debian/postrm \
+	#--config-files /etc/flussonic/flussonic.conf --config-files /etc/flussonic/streams.conf --config-files '/etc/flussonic/*.conf' \
+	#-d 'esl-erlang (>= 15) | esl-erlang-nox (>= 15) | erlang-nox (>= 1:15)' -m "Max Lapshin <max@maxidoors.ru>" -a armel etc/init.d/flussonic etc/flussonic opt 
+
 	mv tmproot/*.deb .
 	rm -rf tmproot
 
@@ -133,10 +157,11 @@ escriptize:
 	./contrib/escriptize
 
 upload:
-	./contrib/license_pack upload $(VERSION)
-	scp flussonic_$(VERSION)_amd64.deb flussonic flussonic-$(VERSION).tgz erlyhub@erlyvideo.org:/apps/erlyvideo/debian/public/binary
+	./contrib/license_pack upload2 $(VERSION)
+	rsync -avz flussonic_$(VERSION)_*.deb flussonic flussonic-$(VERSION).tgz erlyhub@erlyvideo.org:/apps/erlyvideo/debian/public/binary/
 	# scp flussonic erlyhub@erlyvideo.org:/apps/erlyvideo/debian/public/binary/flussonic
 	ssh erlyhub@erlyvideo.org "cd /apps/erlyvideo/debian ; ./update ; cd public/binary ; ln -sf flussonic-$(VERSION).tgz flussonic-latest.tgz "
+	./contrib/send_email.erl erlyvideo-dev@googlegroups.com $(VERSION)
 	@#echo "Erlyvideo version ${VERSION} uploaded to debian repo http://debian.erlyvideo.org/ ." | mail -r "Erlybuild <build@erlyvideo.org>" -s "Erlyvideo version ${VERSION}" -v erlyvideo-dev@googlegroups.com
 
 new_version: tgz package escriptize upload

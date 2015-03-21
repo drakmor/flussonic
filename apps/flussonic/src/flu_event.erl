@@ -23,43 +23,48 @@
 %%%---------------------------------------------------------------------------------------
 -module(flu_event).
 -author('Max Lapshin <max@maxidoors.ru>').
--behaviour(gen_event).
 -include("log.hrl").
 -include("jsonerl.hrl").
 -include("flu_event.hrl").
+-include_lib("eunit/include/eunit.hrl").
 
 %% External API
 -export([start_link/0, notify/1, add_handler/2, subscribe_to_events/1, add_sup_handler/2, remove_handler/1]).
--export([start_handlers/0, stop_handlers/0]).
+-export([start_handlers/0]).
 
--export([user_connected/2, user_disconnected/2, user_play/3, user_stop/3]).
--export([stream_created/2, stream_stopped/1]).
+-export([session_open/2, session_close/2]).
+-export([stream_started/2, stream_stopped/2]).
+-export([file_opened/2, file_closed/2]).
 -export([add_dvr_fragment/2, delete_dvr_fragment/2]).
 
 -export([hls_bitrate_down/2, hls_bitrate_up/2]).
+-export([hls_segment_drop/2]).
+
+-export([publish_started/2, publish_stopped/2]).
 
 -export([to_json/1, to_xml/1, to_proplist/1]).
 
 %% gen_event callbacks
--export([init/1, handle_call/2, handle_event/2, handle_info/2, terminate/2, code_change/3]).
-
 
 start_link() ->
   {ok, Pid} = gen_event:start_link({local, ?MODULE}),
-  start_handlers(),
   {ok, Pid}.
 
 
 
 start_handlers() ->
-  gen_event:add_handler(?MODULE, ?MODULE, []),
-  % lists:foreach(fun(Host) ->
-  %   [gen_event:add_handler(?MODULE, ems_event_hook, [Host, Event, Handler]) || {Event, Handler} <- ems:get_var(event_handlers, Host, [])]
-  % end, Hosts),
+  Config = flu_config:get_config(),
+  Handlers = [{Handler, Args} || {flu_event, Handler, Args} <- Config],
+  NewHandlers = [H || {H,_} <- Handlers],
+  OldHandlers = gen_event:which_handlers(?MODULE),
+  ToInstall = NewHandlers -- OldHandlers,
+  ToUpdate = NewHandlers -- ToInstall,
+  ToRemove = OldHandlers -- NewHandlers,
+  [gen_event:delete_handler(?MODULE, Handler, []) || Handler <- ToRemove],
+  [gen_event:add_handler(?MODULE, Handler, Args) || {Handler, Args} <- Handlers, lists:member(Handler, ToInstall)],
+  [gen_event:call(?MODULE, Handler, {update_options, Args}) || {Handler,Args} <- Handlers, lists:member(Handler, ToUpdate)],
   ok.
 
-stop_handlers() ->
-  [gen_event:delete_handler(?MODULE, Handler, []) || Handler <- gen_event:which_handlers(?MODULE)].
 
 %%--------------------------------------------------------------------
 %% @spec (Event::any()) -> ok
@@ -68,14 +73,20 @@ stop_handlers() ->
 %% @end
 %%----------------------------------------------------------------------
 to_json(#flu_event{options = _Options} = Event) ->
-  Map = fun
-    (V) when is_pid(V) -> undefined;
-    (V) when is_reference(V) -> undefined;
-    (V) -> V
-  end,
-  Clean1 = [{K,Map(V)} || {K,V} <- tuple_to_list(?record_to_struct(flu_event, Event))],
-  Clean = [{K,V} || {K,V} <- Clean1, V =/= undefined andalso V =/= null],
-  mochijson2:encode(Clean).
+  List = lists:zip(record_info(fields, flu_event), tl(tuple_to_list(Event))),
+  iolist_to_binary(mochijson2:encode(clean(List))).
+
+
+clean([]) -> [];
+clean([{_,undefined}|Rest]) -> clean(Rest);
+clean([{K,true}|Rest]) -> [{K,true}|clean(Rest)];
+clean([{K,false}|Rest]) -> [{K,false}|clean(Rest)];
+clean([{K,V}|Rest]) when is_atom(V) -> [{K,V}|clean(Rest)];
+clean([{K,V}|Rest]) when is_integer(V) -> [{K,V}|clean(Rest)];
+clean([{K,V}|Rest]) when is_list(V) -> [{K,clean(V)}|clean(Rest)];
+clean([{K,V}|Rest]) when is_binary(V) -> [{K,V}|clean(Rest)];
+clean([_|Rest]) -> clean(Rest).
+
 
 
 to_proplist(#flu_event{} = Event) ->
@@ -169,10 +180,10 @@ remove_handler(Handler) ->
 %% @doc send event that user has connected
 %% @end
 %%----------------------------------------------------------------------
-user_connected(Stream, Stats) ->
+session_open(Stream, Stats) ->
   UserId = proplists:get_value(user_id, Stats),
   SessionId = proplists:get_value(session_id, Stats),
-  gen_event:notify(?MODULE, #flu_event{event = user.connected, stream = Stream, session_id = SessionId, user_id = UserId, options = Stats}).
+  gen_event:notify(?MODULE, #flu_event{event = 'session.open', stream = Stream, session_id = SessionId, user_id = UserId, options = Stats}).
 
 %%--------------------------------------------------------------------
 %% @spec (Stream, Stats) -> ok
@@ -180,28 +191,11 @@ user_connected(Stream, Stats) ->
 %% @doc send event that user has disconnected
 %% @end
 %%----------------------------------------------------------------------
-user_disconnected(Stream, Stats) ->
+session_close(Stream, Stats) ->
   UserId = proplists:get_value(user_id, Stats),
   SessionId = proplists:get_value(session_id, Stats),
-  gen_event:notify(?MODULE, #flu_event{event = user.disconnected, stream = Stream, session_id = SessionId, user_id = UserId, options = Stats}).
+  gen_event:notify(?MODULE, #flu_event{event = 'session.close', stream = Stream, session_id = SessionId, user_id = UserId, options = Stats}).
 
-%%--------------------------------------------------------------------
-%% @spec (User, Name) -> ok
-%%
-%% @doc send event that user has started playing
-%% @end
-%%----------------------------------------------------------------------
-user_play(User, StreamName, Options) ->
-  gen_event:notify(?MODULE, #flu_event{event = user.play, user = User, stream = StreamName, options = Options}).
-
-%%--------------------------------------------------------------------
-%% @spec (User, Name, Stats) -> ok
-%%
-%% @doc send event that user has finished playing
-%% @end
-%%----------------------------------------------------------------------
-user_stop(User, StreamName, Options) ->
-  gen_event:notify(?MODULE, #flu_event{event = user.stop, user = User, stream = StreamName, options = Options}).
 
 %%--------------------------------------------------------------------
 %% @spec (Name, Stream, Options) -> ok
@@ -209,8 +203,8 @@ user_stop(User, StreamName, Options) ->
 %% @doc send event that stream has been created
 %% @end
 %%----------------------------------------------------------------------
-stream_created(Name, Options) ->
-  gen_event:notify(?MODULE, #flu_event{event = stream.created, stream = Name, options = Options}).
+stream_started(Name, Options) ->
+  gen_event:notify(?MODULE, #flu_event{event = 'stream.started', stream = Name, options = Options}).
 
 %%--------------------------------------------------------------------
 %% @spec (Name, Stream) -> ok
@@ -218,8 +212,8 @@ stream_created(Name, Options) ->
 %% @doc send event that stream was completely stopped
 %% @end
 %%----------------------------------------------------------------------
-stream_stopped(Name) ->
-  gen_event:notify(?MODULE, #flu_event{event = stream.stopped, stream = Name}).
+stream_stopped(Name, Stats) ->
+  gen_event:notify(?MODULE, #flu_event{event = 'stream.stopped', stream = Name, options = Stats}).
 
 %%--------------------------------------------------------------------
 %%
@@ -227,7 +221,7 @@ stream_stopped(Name) ->
 %% @end
 %%----------------------------------------------------------------------
 add_dvr_fragment(Name, Time) ->
-  gen_event:notify(?MODULE, #flu_event{event = stream.add_dvr_fragment, stream = Name, options = [{time,Time}]}).
+  gen_event:notify(?MODULE, #flu_event{event = 'stream.add_dvr_fragment', stream = Name, options = [{time,Time}]}).
 
 
 %%--------------------------------------------------------------------
@@ -236,7 +230,53 @@ add_dvr_fragment(Name, Time) ->
 %% @end
 %%----------------------------------------------------------------------
 delete_dvr_fragment(Name, Time) ->
-  gen_event:notify(?MODULE, #flu_event{event = stream.delete_dvr_fragment, stream = Name, options = [{time,Time}]}).
+  gen_event:notify(?MODULE, #flu_event{event = 'stream.delete_dvr_fragment', stream = Name, options = [{time,Time}]}).
+
+
+
+
+
+
+%%--------------------------------------------------------------------
+%% @spec (Name, Stream, Options) -> ok
+%%
+%% @doc send event that file has been opened
+%% @end
+%%----------------------------------------------------------------------
+file_opened(Name, Options) ->
+  gen_event:notify(?MODULE, #flu_event{event = 'file.opened', stream = Name, options = Options}).
+
+%%--------------------------------------------------------------------
+%% @spec (Name, Stream) -> ok
+%%
+%% @doc send event that stream was completely stopped
+%% @end
+%%----------------------------------------------------------------------
+file_closed(Name, Stats) ->
+  gen_event:notify(?MODULE, #flu_event{event = 'file.closed', stream = Name, options = Stats}).
+
+
+
+
+
+
+
+%%--------------------------------------------------------------------
+%%
+%% @doc send event that stream publishing has started
+%% @end
+%%----------------------------------------------------------------------
+publish_started(Stream, Info) ->
+  gen_event:notify(?MODULE, #flu_event{event = 'stream.publish.started', stream = Stream, options = Info}).
+
+%%--------------------------------------------------------------------
+%%
+%% @doc send event that stream publishing has stopped
+%% @end
+%%----------------------------------------------------------------------
+publish_stopped(Stream, Stats) ->
+  gen_event:notify(?MODULE, #flu_event{event = 'stream.publish.stopped', stream = Stream, options = Stats}).
+
 
 
 %%--------------------------------------------------------------------
@@ -246,89 +286,13 @@ delete_dvr_fragment(Name, Time) ->
 %% @end
 %%----------------------------------------------------------------------
 hls_bitrate_up(Name, Options) ->
-  gen_event:notify(?MODULE, #flu_event{event = hls.bitrate.up, stream = Name, options = Options}).
+  gen_event:notify(?MODULE, #flu_event{event = 'hls.bitrate.up', stream = Name, options = Options}).
 
 hls_bitrate_down(Name, Options) ->
-  gen_event:notify(?MODULE, #flu_event{event = hls.bitrate.down, stream = Name, options = Options}).
+  gen_event:notify(?MODULE, #flu_event{event = 'hls.bitrate.down', stream = Name, options = Options}).
+
+hls_segment_drop(Name, Options) ->
+  gen_event:notify(?MODULE, #flu_event{event = 'hls.segment.drop', stream = Name, options = Options}).
 
 
-%%%------------------------------------------------------------------------
-%%% Callback functions from gen_server
-%%%------------------------------------------------------------------------
 
-%%----------------------------------------------------------------------
-%% @spec ([]) -> {ok, State}           |
-%%                            {ok, State, Timeout}  |
-%%                            ignore                |
-%%                            {stop, Reason}
-%%
-%% @doc Called by gen_server framework at process startup.
-%%      Create listening socket.
-%% @end
-%%----------------------------------------------------------------------
-
-
-init([]) ->
-  {ok, state}.
-
-%%-------------------------------------------------------------------------
-%% @spec (Request, State) -> {reply, Reply, State}          |
-%%                                 {reply, Reply, State, Timeout} |
-%%                                 {noreply, State}               |
-%%                                 {noreply, State, Timeout}      |
-%%                                 {stop, Reason, Reply, State}   |
-%%                                 {stop, Reason, State}
-%% @doc Callback for synchronous server calls.  If `{stop, ...}' tuple
-%%      is returned, the server is stopped and `terminate/2' is called.
-%% @end
-%% @private
-%%-------------------------------------------------------------------------
-handle_call(Request, State) ->
-  {ok, Request, State}.
-
-
-%%-------------------------------------------------------------------------
-%% @spec (Event, State) ->{noreply, State}          |
-%%                      {noreply, State, Timeout} |
-%%                      {stop, Reason, State}
-%% @doc Callback for asyncrous server calls.  If `{stop, ...}' tuple
-%%      is returned, the server is stopped and `terminate/2' is called.
-%% @end
-%% @private
-%%-------------------------------------------------------------------------
-handle_event(_Event, State) ->
-  %?D({ems_event, Event}),
-  {ok, State}.
-
-%%-------------------------------------------------------------------------
-%% @spec (Msg, State) ->{noreply, State}          |
-%%                      {noreply, State, Timeout} |
-%%                      {stop, Reason, State}
-%% @doc Callback for messages sent directly to server's mailbox.
-%%      If `{stop, ...}' tuple is returned, the server is stopped and
-%%      `terminate/2' is called.
-%% @end
-%% @private
-%%-------------------------------------------------------------------------
-handle_info(_Info, State) ->
-  {ok, State}.
-
-%%-------------------------------------------------------------------------
-%% @spec (Reason, State) -> any
-%% @doc  Callback executed on server shutdown. It is only invoked if
-%%       `process_flag(trap_exit, true)' is set by the server process.
-%%       The return value is ignored.
-%% @end
-%% @private
-%%-------------------------------------------------------------------------
-terminate(_Reason, _State) ->
-  ok.
-
-%%-------------------------------------------------------------------------
-%% @spec (OldVsn, State, Extra) -> {ok, NewState}
-%% @doc  Convert process state when code is changed.
-%% @end
-%% @private
-%%-------------------------------------------------------------------------
-code_change(_OldVsn, State, _Extra) ->
-  {ok, State}.

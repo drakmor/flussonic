@@ -10,12 +10,23 @@ parse(Name) ->
 
 
 
+fetch_playlist_mbr_test() ->
+  ?assertMatch(#m3u8_mbr_playlist{
+    playlists = [
+      #m3u8_playlist{url = <<"../test/files/tracks-1,4/index.m3u8">>, bitrate = 1196000},
+      #m3u8_playlist{url = <<"../test/files/tracks-2,4/index.m3u8">>, bitrate = 510000},
+      #m3u8_playlist{url = <<"../test/files/tracks-3,4/index.m3u8">>, bitrate = 155000}
+    ]
+  }, m3u8:fetch("../test/files/playlist-mbr.m3u8")).
+
+
+
 parse_playlist_file_test() ->
   ?assertMatch(#m3u8_playlist{
     sequence = 0,
     type = vod,
     entries = [
-      #m3u8_entry{duration = 4000, number = 0, url = <<"hls/segment1.ts">>},
+      #m3u8_entry{duration = 4000, offset = 2455, utc = 1355825859, number = 0, url = <<"hls/segment1.ts">>},
       #m3u8_entry{duration = 4000, number = 1, url = <<"hls/segment2.ts">>}
     ]
   }, parse("file")).
@@ -42,21 +53,21 @@ parse_playlist_event_test() ->
 
 parse_playlist_server1_test() ->
   ?assertMatch(#m3u8_playlist{
-    sequence = 0,
+    sequence = undefined,
     type = live,
     entries = [
       #m3u8_entry{number = 0, url = <<"priv/bunny.mp4">>},
-      #m3u8_entry{number = 1, url = <<"priv/mbr.mp4">>}
+      #m3u8_entry{number = 1, utc = 1360659488, url = <<"priv/mbr.mp4">>}
     ]
   }, parse("server1")).
 
 parse_playlist_server2_test() ->
   ?assertMatch(#m3u8_playlist{
-    sequence = 0,
+    sequence = undefined,
     type = live,
     entries = [
-      #m3u8_entry{number = 0, url = <<"ort">>, duration = 20000},
-      #m3u8_entry{number = 1, url = <<"priv/bunny.mp4">>}
+      #m3u8_entry{number = 0, utc = 1360673888, url = <<"ort">>, duration = 20000},
+      #m3u8_entry{number = 1, utc = 1360673918, url = <<"priv/bunny.mp4">>}
     ]
   }, parse("server2")).
 
@@ -80,15 +91,6 @@ fetch_playlist_file_test() ->
     ]
   }, m3u8:fetch("../test/files/playlist-file.m3u8")).
 
-
-fetch_playlist_mbr_test() ->
-  ?assertMatch(#m3u8_mbr_playlist{
-    playlists = [
-      #m3u8_playlist{url = <<"../test/files/tracks-1,4/index.m3u8">>, bitrate = 1196000},
-      #m3u8_playlist{url = <<"../test/files/tracks-2,4/index.m3u8">>, bitrate = 510000},
-      #m3u8_playlist{url = <<"../test/files/tracks-3,4/index.m3u8">>, bitrate = 155000}
-    ]
-  }, m3u8:fetch("../test/files/playlist-mbr.m3u8")).
 
 
 fetch_invalid_playlist_test() ->
@@ -117,6 +119,22 @@ no_prepend_base_path_test() ->
 
 
 
+mbr_playlist_with_crlf_test() ->
+Playlist = <<"#EXTM3U\r
+#EXT-X-STREAM-INF:PROGRAM-ID=1, BANDWIDTH=326819\r
+master_Layer1.m3u8\r
+#EXT-X-STREAM-INF:PROGRAM-ID=1, BANDWIDTH=621051\r
+master_Layer2.m3u8\r
+#EXT-X-STREAM-INF:PROGRAM-ID=1, BANDWIDTH=915384\r
+master_Layer3.m3u8\r
+">>,
+    ?assertMatch(#m3u8_mbr_playlist{
+    playlists = [
+      #m3u8_playlist{url = <<"master_Layer1.m3u8">>, bitrate = 326819},
+      #m3u8_playlist{url = <<"master_Layer2.m3u8">>, bitrate = 621051},
+      #m3u8_playlist{url = <<"master_Layer3.m3u8">>, bitrate = 915384}
+    ]
+  }, m3u8:parse(Playlist)).
 
 
 

@@ -55,61 +55,126 @@ main(Options) ->
   io:format("Licensed code loaded~n"),
   ok = start(Options),
   io:format("Flussonic streaming server started. ~nInformation: http://flussonic.com/ (http://erlyvideo.org/)~nContacts: Max Lapshin <info@erlyvideo.org>~n"),
-  loop_readline().
+  loop_shell().
 
-loop_readline() ->
-  case io:get_line("cmd> ") of
-    "r\n" -> 
-      flu:reconf(),
-      loop_readline();
-    _ ->
-      ok
+loop_shell() ->
+  Pid = shell:start(),
+  erlang:monitor(process,Pid),
+  receive
+    {'DOWN',_,_,Pid,_} -> ok
   end,
-  io:format("Flussonic is exiting due to user keypress~n").
+  loop_shell().
   
 
 start() ->
   start([]).
-  
-start(_Options) ->
+
+start(Options) ->
+  try start0(Options)
+  catch
+    throw:{stop,_Code} -> init:stop()
+  end.
+
+
+
+start0(_Options) ->
+  try flussonic_app:read_config()
+  catch
+    invalid_config -> timer:sleep(2000), throw({stop,2})
+  end,
+
+  catch erlang:system_flag(scheduler_bind_type, spread),
   application:start(compiler),
   application:load(lager),
-  application:set_env(lager,handlers,[{lager_console_backend,info}]),
+
+
+  ConsoleFormat = [time, " ", pid, {pid, [" "], ""}, 
+    {module, [module, ":", line, " "], ""},
+    message, "\n"
+  ],
+  FileFormat = [date, " "] ++ ConsoleFormat,
+
+  LogDir = os:getenv("LOGDIR"),
+
+  {FileLogger, CrashLogger} = case LogDir of
+    false ->
+      {[], undefined};
+    _ ->
+      {[{lager_file_backend, [[{LogDir++"/flussonic.log", info, 10485760, "$D04", 40},{lager_default_formatter, FileFormat}]]}], LogDir++"/crash.log"}
+  end,
+
+  application:set_env(lager,handlers,[{lager_console_backend,[info,{lager_default_formatter, ConsoleFormat}]}] ++ FileLogger),
   application:set_env(lager,error_logger_redirect,true),
-  application:set_env(lager,crash_log,undefined),
+  application:set_env(lager,crash_log,CrashLogger),
+  application:set_env(lager,crash_log_msg_size,16384),
+  application:set_env(lager,crash_log_size,1048576),
+  application:set_env(lager,crash_log_date,"$D04"),
+  application:set_env(lager,crash_log_count,5),
+
+
   lager:start(),
+  lager:notice("Flussonic version ~s is booting", [flu:version()]),
+
+  case LogDir of
+    false ->
+      ok;
+    _ ->
+      {ok,Trace} = lager_util:validate_trace({[{request,web}], debug, {lager_file_backend,LogDir ++ "/access.log"}}),
+      gen_event:add_handler(lager_event, {lager_file_backend,LogDir ++ "/access.log"}, [{LogDir ++ "/access.log",debug,10485760,"$D04", 40},{lager_default_formatter,[date," ",time," ",message,"\n"]}]),
+      {MinLogLevel, Traces} = lager_config:get(loglevel),
+      lager_config:set(loglevel, {MinLogLevel, [Trace|Traces]})
+  end,
+
+
+
+  application:start(crypto),
+  application:start(asn1),
+  application:start(public_key),
+  application:start(ssl),
+  start_app(lhttpc),
+
   license_client:load(),
   application:start(sasl),
   error_logger:delete_report_handler(sasl_report_tty_h),
-  start_app(crypto),
   start_app(ranch),
   start_app(mimetypes),
   start_app(cowboy),
   start_app(rtmp),
   start_app(rtsp),
-  start_app(gen_tracker),
   start_app(os_mon),
   try_start_app(dvr),
   try_start_app(hls),
+  try_start_app(central),
   start_app(amf),
   start_app(erlmedia),
   try_start_app(http_file),
   try_start_app(playlist),
+  start_app(pulse),
   start_app(mpegts),
   start_app(flussonic),
   flussonic_app:load_config(),
+  EventLogDir = case LogDir of
+    false -> "log";
+    _ -> LogDir
+  end,
+  flu_event:add_handler(flu_event_log, [EventLogDir]),
+
   write_pid(),
   ok.
 
 
 
+
 write_pid() ->
-  Path = case os:getenv("PID_PATH") of
+  Path = case os:getenv("PIDFILE") of
     false -> "log/flussonic.pid";
     PidPath -> PidPath
   end,
   filelib:ensure_dir(Path),
-  file:write_file(Path, os:getpid()).
+  case file:write_file(Path, os:getpid()) of
+    ok -> ok;
+    {error, Error} -> io:format("Failed to write pid to file ~s because of ~p", [Path, Error])
+  end.
 
 
 try_start_app(App) ->
@@ -127,5 +192,5 @@ start_app(App) ->
 
 load_app(App) ->
   {ok, Mods} = application:get_key(App, modules),
-  [code:load_file(Mod) || Mod <- Mods].
+  [code:load_file(Mod) || Mod <- Mods, Mod =/= license_agent].
 

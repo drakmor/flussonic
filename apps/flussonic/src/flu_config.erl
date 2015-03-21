@@ -32,7 +32,7 @@
 -include_lib("eunit/include/eunit.hrl").
 
 
-set_config(Config) ->
+set_config(Config) when is_list(Config) ->
   application:set_env(flussonic, config, Config).
 
 get_config() ->
@@ -93,8 +93,7 @@ load_includes(Env, ConfigPath) ->
 load_includes([{include, Wildcard}|Env], Root, Acc) ->
   Files = filelib:wildcard(Wildcard, Root),
   Env1 = lists:foldr(fun(File, Env_) ->
-    {ok, SubEnv, SubPath} = file:path_consult([Root], File),
-    ?D({include,SubPath}),
+    {ok, SubEnv, _SubPath} = file:path_consult([Root], File),
     SubEnv ++ Env_
   end, Env, Files),
   load_includes(Env1, Root, Acc);
@@ -111,52 +110,57 @@ to_b(Binary) when is_binary(Binary) -> Binary;
 to_b(undefined) -> undefined;
 to_b(Atom) when is_atom(Atom) -> binary_to_atom(Atom, latin1).
 
+global_keys() -> [sessions,http_auth].
+
 expand_options(Env) ->
-  GlobalKeys = [sessions],
+  GlobalKeys = global_keys(),
   GlobalOptions = [Entry || Entry <- Env, is_tuple(Entry) andalso lists:member(element(1,Entry),GlobalKeys)],
 
   [expand_entry(Entry,GlobalOptions) || Entry <- Env].
 
+expand_entry({central, URL},GlobalOptions) -> {central, to_b(URL), GlobalOptions};
+expand_entry({central, URL, Options},GlobalOptions) -> {central, to_b(URL), merge(Options,GlobalOptions)};
 expand_entry({rewrite, Path, URL},GlobalOptions) -> {stream, to_b(Path), to_b(URL), merge([{static,false}],GlobalOptions)};
-expand_entry({rewrite, Path, URL, Options},GlobalOptions) -> {stream, to_b(Path), to_b(URL), merge([{static,false}],Options,GlobalOptions)};
+expand_entry({rewrite, Path, URL, Options},GlobalOptions) -> {stream, to_b(Path), to_b(URL), merge([{static,false}]++Options,GlobalOptions)};
 expand_entry({stream, Path, URL},GlobalOptions) -> {stream, to_b(Path), to_b(URL), merge([{static,true}],GlobalOptions)};
-expand_entry({stream, Path, URL, Options},GlobalOptions) -> {stream, to_b(Path), to_b(URL), merge([{static,true}],Options,GlobalOptions)};
-expand_entry({mpegts, Prefix},GlobalOptions) -> {mpegts, to_b(Prefix), GlobalOptions};
-expand_entry({mpegts, Prefix, Options},GlobalOptions) -> {mpegts, to_b(Prefix), merge(Options,GlobalOptions)};
-expand_entry({live, Prefix},GlobalOptions) -> {live, to_b(Prefix), GlobalOptions};
-expand_entry({live, Prefix, Options},GlobalOptions) -> {live, to_b(Prefix), merge(Options,GlobalOptions)};
+expand_entry({stream, Path, URL, Options},GlobalOptions) -> {stream, to_b(Path), to_b(URL), merge([{static,true}]++Options,GlobalOptions)};
+expand_entry({mpegts, Prefix},GlobalOptions) -> {mpegts, to_b(Prefix), merge([{clients_timeout,false}],GlobalOptions)};
+expand_entry({mpegts, Prefix, Options},GlobalOptions) -> {mpegts, to_b(Prefix), merge(Options ++ [{clients_timeout,false}],GlobalOptions)};
+expand_entry({webm, Prefix},GlobalOptions) -> {webm, to_b(Prefix), merge([{clients_timeout,false}],GlobalOptions)};
+expand_entry({webm, Prefix, Options},GlobalOptions) -> {webm, to_b(Prefix), merge(Options ++ [{clients_timeout,false}],GlobalOptions)};
+expand_entry({live, Prefix},GlobalOptions) -> {live, to_b(Prefix), merge([{clients_timeout,false}], GlobalOptions)};
+expand_entry({live, Prefix, Options},GlobalOptions) -> {live, to_b(Prefix), merge(Options ++ [{clients_timeout,false}],GlobalOptions)};
 expand_entry({file, Prefix, Root},GlobalOptions) -> {file, to_b(Prefix), to_b(Root), GlobalOptions};
 expand_entry({file, Prefix, Root, Options},GlobalOptions) -> {file, to_b(Prefix), to_b(Root), merge(Options,GlobalOptions)};
-expand_entry(api, _GlobalOptions) -> {api, []};
+expand_entry(api, GlobalOptions) -> {api, GlobalOptions};
+expand_entry({api, Options}, GlobalOptions) -> {api, merge(Options,GlobalOptions)};
+expand_entry({http_events, URL},_GlobalOptions) -> {flu_event, flu_event_http, [list_to_binary(URL), []]};
 expand_entry({plugin, Plugin},_GlobalOptions) -> {plugin, Plugin, []};
 expand_entry(Entry,_GlobalOptions) -> Entry.
 
-merge(Opts1, Opts2) ->
-  lists:ukeymerge(1, lists:ukeysort(1, Opts1), lists:ukeysort(1,Opts2)).
+merge(Opts, Global) ->
+  Global1 = lists:foldl(fun(Key,G) ->
+    case lists:keyfind(Key,1,Opts) of
+      false -> G;
+      _ -> lists:keydelete(Key,1,G)
+    end
+  end, Global, global_keys()),
+  optsort(Opts ++ Global1).
 
-merge(Opts1, Opts2, Opts3) ->
-  merge(Opts1, merge(Opts2, Opts3)).
+
+optsort(Opts) ->
+  lists:usort(fun
+    (T1,T2) when is_tuple(T1), is_tuple(T2) -> tuple_to_list(T1) =< tuple_to_list(T2);
+    (T1,A2) when is_tuple(T1) -> element(1,T1) =< A2;
+    (A1,T2) when is_tuple(T2) -> A1 =< element(1,T2);
+    (A1,A2) -> A1 =< A2
+  end, Opts).
+
+
+
 
 
 parse_routes([]) -> [];
-
-parse_routes([{live, Prefix, Opts}|Env]) ->
-  Tokens = tokens(Prefix),
-  [{Tokens ++ ['...'], media_handler, merge(Opts, [{autostart,false},{dynamic,true},{module,flu_stream}])}
-  |parse_routes(Env)];
-
-parse_routes([{stream, Path, URL, Options}|Env]) ->
-  Tokens2 = tokens(Path),
-  
-  [
-    {Tokens2 ++ [<<"mpegts">>], mpegts_handler, merge([{name,Path},{url,URL}], Options)},
-    {Tokens2 ++ ['...'], media_handler, merge([{name,Path},{url,URL},{module,flu_stream},{name_length,length(Tokens2)}], Options)}
-  |parse_routes(Env)];
-  
-parse_routes([{file, Prefix, Root,Options}|Env]) ->
-  Tokens = tokens(Prefix),
-  [{Tokens ++ ['...'], media_handler, merge([{module,flu_file},{root, Root}],Options)}
-  |parse_routes(Env)];
 
 parse_routes([{root, Root}|Env]) ->
   Module = case is_escriptized(Root) of
@@ -164,30 +168,18 @@ parse_routes([{root, Root}|Env]) ->
     false -> cowboy_static
   end,
   [
-  {[], Module, [
-    {directory, Root},
-    {mimetypes, [{<<".html">>,[<<"text/html">>]}]},
-    {file, <<"index.html">>}
-  ]},
-  {['...'], Module, [
+  {"/[...]", Module, [
     {directory,Root},
     {mimetypes, {fun mimetypes:path_to_mimes/2, default}}
   ]}|parse_routes(Env)];
 
-parse_routes([{mpegts,Prefix,Options}|Env]) ->
-  Tokens = tokens(Prefix),
-  [{Tokens ++ ['...'], mpegts_handler, Options}
+
+parse_routes([{webm,Prefix,Options}|Env]) ->
+  [{<<"/",Prefix/binary, "/[...]">>, webm_handler, [{publish_enabled,true}|Options]}
   |parse_routes(Env)];
 
 parse_routes([{api,Options}|Env]) ->
-  [
-    {[<<"erlyvideo">>,<<"api">>,<<"reload">>], api_handler, [{mode,reload}|Options]},
-    {[<<"erlyvideo">>,<<"api">>,<<"events">>], api_handler, [{mode,events}|Options]},
-    {[<<"erlyvideo">>,<<"api">>,<<"streams">>], api_handler, [{mode,streams}|Options]},
-    {[<<"erlyvideo">>,<<"api">>,<<"stream_health">>, '...'], api_handler, [{mode,health}|Options]},
-    {[<<"erlyvideo">>,<<"api">>,<<"dvr_status">>, year, month, day, '...'], dvr_handler, [{mode,status}|Options]},
-    {[<<"erlyvideo">>,<<"api">>,<<"dvr_previews">>, year, month, day, hour, minute, '...'], dvr_handler, [{mode,previews}|Options]}
-  |parse_routes(Env)];
+  api_handler:routes(Options) ++ parse_routes(Env);
 
 parse_routes([{plugin,Plugin,Options}|Env]) ->
   case erlang:module_loaded(Plugin) of
@@ -203,8 +195,8 @@ parse_routes([_Else|Env]) ->
   parse_routes(Env).
 
 
-tokens(String) ->
-  [cowboy_http:urldecode(Bin, crash) || Bin <- binary:split(String, <<"/">>, [global])].
+% tokens(String) ->
+%   [cowboy_http:urldecode(Bin, crash) || Bin <- binary:split(String, <<"/">>, [global])].
 
 
 

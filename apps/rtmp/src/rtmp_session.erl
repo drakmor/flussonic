@@ -163,11 +163,19 @@ send(Session, Message) ->
 %%          {stop, Reason, Reply, NewStateData}
 %% @private
 %%-------------------------------------------------------------------------
-handle_call({socket_ready, RTMP}, _From, State) ->
+handle_call({socket_ready, RTMP}, From, State) ->
   erlang:monitor(process, RTMP),
-  (catch ems_network_lag_monitor:watch(RTMP)),
-  % rtmp_socket:setopts(RTMP, [{debug,true}]),
-  {reply, ok, State#rtmp_session{socket = RTMP}};
+  gen_server:reply(From, ok),
+
+  rtmp_socket:setopts(RTMP, [{active, once}]),
+  {rtmp, Socket} = rtmp_socket:get_socket(RTMP),  
+  {address, {IP, Port}} = rtmp_socket:getopts(RTMP, address),
+  Addr = case IP of
+    undefined -> "0.0.0.0";
+    _ -> iolist_to_binary(inet_parse:ntoa(IP))
+  end,
+  {noreply, State#rtmp_session{addr = Addr, port = Port, socket = RTMP, tcp_socket = Socket}};
+
 
 handle_call({get_field, Field}, _From, State) ->
   {reply, get_field(State, Field), State};
@@ -208,17 +216,12 @@ handle_info({rtmp, Socket, #rtmp_message{} = Message}, State) ->
   State2 = flush_reply(State1),
   % [{message_queue_len, Messages}, {memory, Memory}] = process_info(self(), [message_queue_len, memory]),
   % io:format("messages=~p,memory=~p~n", [Messages, Memory]),
-  rtmp_socket:setopts(Socket, [{active, once}]),
-  {noreply, State2};
+  try rtmp_socket:setopts(Socket, [{active, once}]) of
+    _ -> {noreply, State2}
+  catch
+    exit:{normal,_} -> {stop, normal, State2}
+  end;
 
-handle_info({rtmp, Socket, connected}, State) ->
-  rtmp_socket:setopts(Socket, [{active, once}]),
-  {address, {IP, Port}} = rtmp_socket:getopts(Socket, address),
-  Addr = case IP of
-    undefined -> "0.0.0.0";
-    _ -> lists:flatten(io_lib:format("~p.~p.~p.~p", erlang:tuple_to_list(IP)))
-  end,
-  {noreply, State#rtmp_session{addr = Addr, port = Port}};
 
 handle_info({rtmp, _Socket, timeout}, #rtmp_session{module = M} = State) ->
   {ok, State1} = M:handle_control(timeout, State),
@@ -342,7 +345,12 @@ handle_rtmp_message(#rtmp_session{socket = Socket} = State, #rtmp_message{type =
       Recorder ! Frame,
       State;
     #rtmp_stream{} ->
-      ?D({broken_frame_on_empty_stream,Type,StreamId,Timestamp}),
+      case get(broken_frame_count) of undefined -> put(broken_frame_count,0); _-> ok end,
+      put(broken_frame_count, get(broken_frame_count) + 1),
+      case get(broken_frame_count) of
+        Cnt when Cnt < 10 -> ?D({broken_frame_on_empty_stream,Type,StreamId,Timestamp});
+        _ -> error(too_many_broken_frames)
+      end,
       State;
     false ->
       rtmp_socket:status(Socket, StreamId, <<"NetStream.Publish.Failed">>),
@@ -404,22 +412,20 @@ call_function(#rtmp_session{} = State, #rtmp_funcall{} = AMF) ->
   call_function_callback(State, AMF).
 
 
-call_function_callback(Session, #rtmp_funcall{command = Command, args = Args} = AMF) ->
-  try call_function_callback0(Session, AMF)
-  catch
-    Class:Error ->
-      ?debugFmt("Failed RTMP ~p(~p): ~p:~p, ~p", [Command, Args, Class, Error, erlang:get_stacktrace()])
-      % error_logger:error_msg("Failed RTMP ~p(~p): ~p:~p, ~p", [Command, Args, Class, Error, erlang:get_stacktrace()])
-  end.
-
-call_function_callback0(#rtmp_session{module = M} = Session, #rtmp_funcall{} = AMF) ->
-  case M:handle_rtmp_call(Session, AMF) of
+call_function_callback(#rtmp_session{module = M} = Session, #rtmp_funcall{command = Command, args = Args} = AMF) ->
+  try M:handle_rtmp_call(Session, AMF) of
     unhandled ->
       call_default_function(Session, AMF);
     {unhandled, Session1, AMF1} ->
-      call_default_function(Session1, AMF1);  
+      call_default_function(Session1, AMF1);
+    shutdown ->
+      exit(normal);
     #rtmp_session{} = Session1 ->
       Session1
+  catch
+    Class:Error ->
+      ?debugFmt("Failed RTMP ~p(~p): ~p:~p, ~p", [Command, Args, Class, Error, erlang:get_stacktrace()]),
+      Session
   end.
 
 call_default_function(#rtmp_session{module = M} = Session, #rtmp_funcall{command = Command} = AMF) ->
@@ -476,7 +482,9 @@ send_frame(#video_frame{content = Content, stream_id = FrameId, dts = DTS, pts =
       % case Frame#video_frame.content of
       %   metadata -> ?D(Frame);
       %   _ ->
-      %     (catch ?D({StreamId, Frame#video_frame.codec,Frame#video_frame.flavor, round(DTS), rtmp:justify_ts(DTS - BaseDts), Frame#video_frame.sound})),
+      %     case get(first_dts_at) of undefined -> put(first_dts_at, os:timestamp()); _ -> ok end,
+      %     RealDelta = timer:now_diff(os:timestamp(), get(first_dts_at)) div 1000,
+      %     (catch ?D({StreamId, Frame#video_frame.codec,Frame#video_frame.flavor, round(DTS), rtmp:justify_ts(DTS - BaseDts), rtmp:justify_ts(DTS - BaseDts) - RealDelta})),
       %     ok
       % end,
 

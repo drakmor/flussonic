@@ -16,22 +16,18 @@ find_or_open_test_() ->
 
 
 setup() ->
-  error_logger:delete_report_handler(error_logger_tty_h),
   application:stop(ranch),
-  application:stop(gen_tracker),
   application:stop(flussonic),
   ok = application:start(ranch),
-  ok = application:start(gen_tracker),
   ok = application:start(flussonic),
-  gen_tracker_sup:start_tracker(flu_streams),
-  gen_tracker_sup:start_tracker(flu_files),
   ok.
 
 
 teardown(_) ->
+  error_logger:delete_report_handler(error_logger_tty_h),
   application:stop(ranch),
-  application:stop(gen_tracker),
   application:stop(flussonic),
+  error_logger:add_report_handler(error_logger_tty_h),
   ok.
 
 set_config(Env) ->
@@ -67,13 +63,13 @@ lookup_test_() ->
 
 lookup_vod() ->
   set_config([{file, "vod", "priv"}]),
-  ?assertEqual({ok, {file, <<"bunny.mp4">>, [{root, <<"priv">>}]}}, flu_media:lookup("vod/bunny.mp4")),
+  ?assertEqual({ok, {file, <<"vod/bunny.mp4">>, [{path,<<"priv/bunny.mp4">>}]}}, flu_media:lookup("vod/bunny.mp4")),
   ?assertEqual({error, enoent}, flu_media:lookup("securevod/bunny.mp4")),
   ok.
 
 lookup_securevod() ->
   set_config([{file, "securevod", "priv", [{sessions, "url"}]}]),
-  ?assertEqual({ok, {file, <<"bunny.mp4">>, [{root, <<"priv">>},{sessions, "url"}]}}, flu_media:lookup("securevod/bunny.mp4")),
+  ?assertEqual({ok, {file, <<"securevod/bunny.mp4">>, [{path, <<"priv/bunny.mp4">>},{sessions, "url"}]}}, flu_media:lookup("securevod/bunny.mp4")),
   ?assertEqual({error, enoent}, flu_media:lookup("vod/bunny.mp4")),
   ok.
 
@@ -84,12 +80,12 @@ lookup_stream() ->
 
 lookup_live() ->
   set_config([{live, "prefix"}]),
-  ?assertEqual({ok, {live, <<"ustream">>, [{prefix,<<"prefix">>}]}}, flu_media:lookup("prefix/ustream")),
+  ?assertEqual({ok, {live, <<"prefix/ustream">>, [{prefix,<<"prefix">>},{clients_timeout,false}]}}, flu_media:lookup("prefix/ustream")),
   ok.
 
 lookup_live_secure() ->
   set_config([{live, "prefix", [{sessions, "url"}]}]),
-  ?assertEqual({ok, {live, <<"ustream">>, [{prefix,<<"prefix">>},{sessions, "url"}]}}, flu_media:lookup("prefix/ustream")),
+  ?assertEqual({ok, {live, <<"prefix/ustream">>, [{prefix,<<"prefix">>},{clients_timeout,false},{sessions, "url"}]}}, flu_media:lookup("prefix/ustream")),
   ok.
 
 

@@ -48,6 +48,38 @@
 -export([content_offset/1, append_dts/2]).
 -export([frame_sorter/2, decode_list/1]).
 
+
+-export([open/1, read/1]).
+
+open(Path) ->
+  case file:open(Path, [binary,read,raw]) of
+    {ok, F} ->
+      case file:read(F, 13) of
+        {ok, <<"FLV", _/binary>>} -> {ok, F};
+        Else -> file:close(F), {error, {bad_flv,Else}}
+      end;
+    {error, _} = Error ->
+      Error
+  end.
+
+% <<Type, Size:24, _TS:32, _StreamId:24, _Tag:Size/binary, _PrevSize:32
+read(F) ->
+  % 1 + 3 + 4 + 3 = 11
+  case file:read(F, 11) of
+    {ok, <<_, Size:24, _:32, _:24>> = Header} ->
+      {ok, Body} = file:read(F, Size + 4),
+      {ok, Tag, <<_:32>>} = read_tag(<<Header/binary, Body/binary>>),
+      flv_video_frame:tag_to_video_frame(Tag);
+    eof ->
+      eof
+  end.
+
+
+
+
+
+
+
 content_offset(h264) -> ?FLV_TAG_HEADER_LENGTH + 5;
 content_offset(aac) -> ?FLV_TAG_HEADER_LENGTH + 2;
 content_offset(_) -> ?FLV_TAG_HEADER_LENGTH + 1.
@@ -73,6 +105,9 @@ read_all_frames(<<Size:32, "mdat", FLV/binary>> = Bin) when Size == size(Bin) ->
 
 read_all_frames(<<Size:32, "mdat", _/binary>> = Bin) ->
   error({invalid_hds, Size, size(Bin)});
+
+read_all_frames(<<"FLV", _:10/binary, FLV/binary>>) ->
+  read_all_frames(FLV);
 
 read_all_frames(Binary) ->
   try read_frame(Binary) of
@@ -189,7 +224,7 @@ rtmp_tag_generator0(#video_frame{content = Content, dts = DTS} = Frame) ->
     video -> 9;
     metadata -> 18
   end,
-  TagSize = <<(size(Tag)):24, Type>>,
+  TagSize = <<(iolist_size(Tag)):24, Type>>,
   fun(StartDTS, StreamId) ->
     ChannelId = rtmp_lib:channel_id(Content, StreamId),
     [rtmp:encode_id(new, ChannelId), <<(round(DTS - StartDTS)):24>>, TagSize, <<StreamId:32/little>>, Tag]
@@ -436,8 +471,8 @@ encode_audio_tag(#flv_audio_tag{flavor = config,
                 	  bitsize	= BitSize,
                 	  rate	= SoundRate,
                     body = Body}) when is_binary(Body) ->
-  <<?FLV_AUDIO_FORMAT_AAC:4, (flv:audio_rate(SoundRate)):2, (flv:audio_size(BitSize)):1, (flv:audio_type(Channels)):1,
-    ?FLV_AUDIO_AAC_SEQUENCE_HEADER:8, Body/binary>>;
+  [<<?FLV_AUDIO_FORMAT_AAC:4, (flv:audio_rate(SoundRate)):2, (flv:audio_size(BitSize)):1, (flv:audio_type(Channels)):1,
+    ?FLV_AUDIO_AAC_SEQUENCE_HEADER:8>>, Body];
 
 
 encode_audio_tag(#flv_audio_tag{codec = aac,
@@ -445,15 +480,15 @@ encode_audio_tag(#flv_audio_tag{codec = aac,
                     bitsize	= BitSize,
                 	  rate	= SoundRate,
                     body = Body}) when is_binary(Body) ->
-	<<?FLV_AUDIO_FORMAT_AAC:4, (flv:audio_rate(SoundRate)):2, (flv:audio_size(BitSize)):1, (flv:audio_type(Channels)):1,
-	  ?FLV_AUDIO_AAC_RAW:8, Body/binary>>;
+	[<<?FLV_AUDIO_FORMAT_AAC:4, (flv:audio_rate(SoundRate)):2, (flv:audio_size(BitSize)):1, (flv:audio_type(Channels)):1,
+	  ?FLV_AUDIO_AAC_RAW:8>>, Body];
 
 encode_audio_tag(#flv_audio_tag{codec = Codec,
                     channels	= Channels,
                     bitsize	= BitSize,
                 	  rate	= SoundRate,
                     body = Body}) when is_binary(Body) ->
-	<<(flv:audio_codec(Codec)):4, (flv:audio_rate(SoundRate)):2, (flv:audio_size(BitSize)):1, (flv:audio_type(Channels)):1, Body/binary>>.
+	[<<(flv:audio_codec(Codec)):4, (flv:audio_rate(SoundRate)):2, (flv:audio_size(BitSize)):1, (flv:audio_type(Channels)):1>>, Body].
 
 
 
@@ -461,18 +496,18 @@ encode_video_tag(#flv_video_tag{flavor = config,
                    	codec = h264,
                    	composition_time = Time,
                     body = Body}) when is_binary(Body) ->
-	<<(flv:frame_type(keyframe)):4, (flv:video_codec(h264)):4, ?FLV_VIDEO_AVC_SEQUENCE_HEADER, (round(Time)):24, Body/binary>>;
+	[<<(flv:frame_type(keyframe)):4, (flv:video_codec(h264)):4, ?FLV_VIDEO_AVC_SEQUENCE_HEADER, (round(Time)):24>>, Body];
 
 encode_video_tag(#flv_video_tag{flavor = Flavor,
                    	codec = h264,
                    	composition_time = Time,
                     body = Body}) when is_binary(Body) ->
-	<<(flv:frame_type(Flavor)):4, (flv:video_codec(h264)):4, ?FLV_VIDEO_AVC_NALU, (round(Time)):24, Body/binary>>;
+	[<<(flv:frame_type(Flavor)):4, (flv:video_codec(h264)):4, ?FLV_VIDEO_AVC_NALU, (round(Time)):24>>, Body];
 
 encode_video_tag(#flv_video_tag{flavor = Flavor,
                    	codec = CodecId,
                     body = Body}) when is_binary(Body) ->
-	<<(flv:frame_type(Flavor)):4, (flv:video_codec(CodecId)):4, Body/binary>>.
+	[<<(flv:frame_type(Flavor)):4, (flv:video_codec(CodecId)):4>>, Body].
 
 
 encode_meta_tag(Metadata) when is_binary(Metadata) ->

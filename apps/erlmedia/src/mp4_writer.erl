@@ -149,9 +149,14 @@ dump_media(Options) ->
   Reader = proplists:get_value(reader, Options),
   StartPos = proplists:get_value(start_pos, Options),
     
+
+  put(status, init_mp4_writer),
   {ok, Converter} = mp4_writer:init(Writer, [{method,two_pass}|Options]),
+  put(status, dump_pass_1),
   {ok, Converter1} = dump_media_2pass(Reader, Converter, StartPos),
+  put(status, write_moov),
   {ok, Converter2} = shift_and_write_moov(Converter1),
+  put(status, dump_pass_2),
   {ok, _Converter3} = dump_media_2pass(Reader, Converter2, StartPos),
   ok.
 
@@ -223,7 +228,7 @@ handle_frame(#video_frame{codec = empty}, Convertor) ->
 handle_frame(#video_frame{flavor = config} = Frame, #convertor{write_offset = WriteOffset, writer = Writer, method = two_pass2} = Convertor) ->
   Body = flv_video_frame:to_tag(Frame),
   Writer(WriteOffset, Body),
-  {ok, Convertor#convertor{write_offset = WriteOffset + size(Body)}};
+  {ok, Convertor#convertor{write_offset = WriteOffset + iolist_size(Body)}};
     
 handle_frame(#video_frame{flavor = config, content = Content, body = Config} = Frame, #convertor{write_offset = WriteOffset} = Convertor) ->
   Convertor1 = case Content of
@@ -231,7 +236,7 @@ handle_frame(#video_frame{flavor = config, content = Content, body = Config} = F
     video -> Convertor#convertor{video_config = Config}
   end,
   Body = flv_video_frame:to_tag(Frame),             
-  {ok, Convertor1#convertor{write_offset = WriteOffset + size(Body)}};
+  {ok, Convertor1#convertor{write_offset = WriteOffset + iolist_size(Body)}};
 
 handle_frame(#video_frame{codec = mp3, body = Body}, #convertor{audio_config = undefined} = Convertor) ->
   {ok, #mp3_frame{} = Config, _} = mp3:read(Body),
@@ -242,30 +247,30 @@ handle_frame(#video_frame{codec = mp3, body = Body}, #convertor{audio_config = u
 handle_frame(#video_frame{content = metadata} = Frame, #convertor{write_offset = WriteOffset, writer = Writer, method = two_pass2} = Convertor) ->
   Body = flv_video_frame:to_tag(Frame),
   Writer(WriteOffset, Body),
-  {ok, Convertor#convertor{write_offset = WriteOffset + size(Body)}};
+  {ok, Convertor#convertor{write_offset = WriteOffset + iolist_size(Body)}};
   
 handle_frame(#video_frame{content = metadata} = Frame, #convertor{method = two_pass, write_offset = WriteOffset} = Convertor) ->
   Body = flv_video_frame:to_tag(Frame),             
-  {ok, Convertor#convertor{write_offset = WriteOffset + size(Body)}};
+  {ok, Convertor#convertor{write_offset = WriteOffset + iolist_size(Body)}};
 
 handle_frame(#video_frame{} = Frame,
              #convertor{write_offset = WriteOffset, writer = Writer, method = one_pass} = Convertor) ->
   Body = flv_video_frame:to_tag(Frame),             
   Writer(WriteOffset, Body),
   {ok, Convertor1} = append_frame_to_list(Frame, Convertor),
-  {ok, Convertor1#convertor{write_offset = WriteOffset + size(Body)}};
+  {ok, Convertor1#convertor{write_offset = WriteOffset + iolist_size(Body)}};
 
 handle_frame(#video_frame{} = Frame,
              #convertor{write_offset = WriteOffset, method = two_pass} = Convertor) ->
   Body = flv_video_frame:to_tag(Frame),             
   {ok, Convertor1} = append_frame_to_list(Frame, Convertor),
-  {ok, Convertor1#convertor{write_offset = WriteOffset + size(Body)}};
+  {ok, Convertor1#convertor{write_offset = WriteOffset + iolist_size(Body)}};
 
 handle_frame(#video_frame{} = Frame,
              #convertor{write_offset = WriteOffset, writer = Writer, method = two_pass2} = Convertor) ->
   Body = flv_video_frame:to_tag(Frame),             
   Writer(WriteOffset, Body),
-  {ok, Convertor#convertor{write_offset = WriteOffset + size(Body)}};
+  {ok, Convertor#convertor{write_offset = WriteOffset + iolist_size(Body)}};
 
 handle_frame(eof, #convertor{write_offset = WriteOffset, writer = Writer, method = one_pass} = Convertor) ->
   Writer(0, <<(WriteOffset):32>>),
@@ -280,11 +285,11 @@ append_frame_to_list(#video_frame{dts = DTS} = Frame, #convertor{max_dts = Max} 
 
 append_frame_to_list(#video_frame{body = Body, content = video, codec = Codec} = Frame, 
              #convertor{write_offset = WriteOffset, video_frames = Video} = Convertor) ->
-  {ok, Convertor#convertor{video_frames = [Frame#video_frame{body = {WriteOffset + flv:content_offset(Codec),size(Body)}}|Video]}};
+  {ok, Convertor#convertor{video_frames = [Frame#video_frame{body = {WriteOffset + flv:content_offset(Codec),iolist_size(Body)}}|Video]}};
 
 append_frame_to_list(#video_frame{body = Body, content = audio, codec = Codec} = Frame,
              #convertor{write_offset = WriteOffset, audio_frames = Audio} = Convertor) ->
-  {ok, Convertor#convertor{audio_frames = [Frame#video_frame{body = {WriteOffset + flv:content_offset(Codec),size(Body)}}|Audio]}}.
+  {ok, Convertor#convertor{audio_frames = [Frame#video_frame{body = {WriteOffset + flv:content_offset(Codec),iolist_size(Body)}}|Audio]}}.
 
 
 shift_and_write_moov(#convertor{writer = Writer, write_offset = WriteOffset, method = two_pass, options = Options} = Convertor) ->
